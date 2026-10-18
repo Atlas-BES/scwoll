@@ -282,12 +282,15 @@ fn download_bytes(url: &str) -> Option<Vec<u8>> {
 }
 
 /// Duration in seconds via ffprobe (None for streams it can't probe,
-/// e.g. YouTube URLs without yt-dlp handling).
+/// e.g. YouTube URLs without yt-dlp handling). Short timeout so dead
+/// streams fail fast instead of hanging the queue.
 fn video_duration(input: &str) -> Option<f64> {
     let out = Command::new("ffprobe")
         .args([
             "-v",
             "error",
+            "-timeout",
+            "10000000",
             "-show_entries",
             "format=duration",
             "-of",
@@ -306,11 +309,57 @@ fn video_duration(input: &str) -> Option<f64> {
         .filter(|d| *d > 0.0)
 }
 
+/// Mosaic geometry: 120px cells tile to a 360x240 JPEG (~15-25KB at
+/// quality 62) — still sharp in the ~300px card slot, ~half the bytes
+/// of the old 160px / 480x320 layout.
+const MOSAIC_CELL: u32 = 120;
+const MOSAIC_COLS: usize = 3;
+const MOSAIC_JPEG_QUALITY: u8 = 62;
+
+fn mosaic_black_cell() -> image::RgbImage {
+    image::RgbImage::from_pixel(
+        MOSAIC_CELL,
+        MOSAIC_CELL,
+        image::Rgb([10, 10, 16]),
+    )
+}
+
+/// Tile `cells` (each MOSAIC_CELL², missing slots black-filled) 3x2 and
+/// encode straight to memory — no intermediate mosaic file on disk.
+fn encode_mosaic_jpeg(cells: &[image::RgbImage]) -> Option<Vec<u8>> {
+    let (cw, rows) = (MOSAIC_CELL, cells.len().div_ceil(MOSAIC_COLS).max(1) as u32);
+    let mut canvas = image::RgbImage::new(cw * MOSAIC_COLS as u32, cw * rows);
+    // paint background so short/partial mosaics have no garbage pixels
+    for p in canvas.pixels_mut() {
+        *p = image::Rgb([10, 10, 16]);
+    }
+    for (i, cell) in cells.iter().enumerate() {
+        if cell.width() != MOSAIC_CELL || cell.height() != MOSAIC_CELL {
+            continue;
+        }
+        image::imageops::replace(
+            &mut canvas,
+            cell,
+            ((i % MOSAIC_COLS) * MOSAIC_CELL as usize) as i64,
+            ((i / MOSAIC_COLS) * MOSAIC_CELL as usize) as i64,
+        );
+    }
+    let mut buf = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, MOSAIC_JPEG_QUALITY)
+        .encode_image(&image::DynamicImage::ImageRgb8(canvas))
+        .ok()?;
+    if buf.is_empty() {
+        return None;
+    }
+    Some(buf)
+}
 /// 6 frames equally spaced across the whole video, square-cropped and
-/// tiled 3x2 into one 480x320 mosaic JPEG.
+/// tiled 3x2 into one 360x240 mosaic JPEG.
 /// Engine 1: ffprobe duration + ffmpeg seeks (fast, precise).
 /// Engine 2: mpv percent-seeks (needs only mpv — works outside nix-shell
 /// and for anything mpv can open, incl. YouTube URLs).
+/// Both engines are tolerant: a failed frame reuses the previous good one
+/// (or black) so one bad seek doesn't lose the whole mosaic.
 fn grab_mosaic_bytes(input: &str) -> Option<Vec<u8>> {
     if let Some(b) = grab_mosaic_ffmpeg(input) {
         return Some(b);
@@ -323,63 +372,84 @@ fn grab_mosaic_ffmpeg(input: &str) -> Option<Vec<u8>> {
     let dur = video_duration(input)?;
     let dir = std::env::temp_dir().join(format!("scwoll-mosaic-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).ok()?;
-    let mut cells: Vec<PathBuf> = vec![];
+    // Smaller cells (120px), no audio/subtitles, cheap JPEG: each grab is
+    // faster to decode, scale, write and re-read than the old 160px/q5.
+    let vf = format!(
+        "scale={c}:{c}:force_original_aspect_ratio=increase,crop={c}:{c}",
+        c = MOSAIC_CELL
+    );
+    let mut cells: Vec<image::RgbImage> = Vec::with_capacity(6);
+    let mut good = 0;
     for i in 0..6 {
-        let t = dur * (i as f64 + 0.5) / 6.0;
+        // endpoints inclusive: first cell in the first second, last cell in
+        // the last second, rest evenly between.
+        let t = (0.5 + i as f64 * (dur - 1.0) / 5.0).clamp(0.0, dur * 0.98);
+        // hybrid seek: fast-seek to just before, then accurate-seek the rest
+        // (plain input -ss snaps to keyframes and clusters frames).
+        let pre = (t - 5.0).max(0.0);
+        let post = t - pre;
         let out = dir.join(format!("c{i}.jpg"));
         let ok = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-v",
                 "error",
+                "-an",
+                "-sn",
+                "-dn",
                 "-ss",
-                &format!("{t:.2}"),
+                &format!("{pre:.2}"),
+                "-timeout",
+                "10000000",
                 "-i",
                 input,
+                "-ss",
+                &format!("{post:.2}"),
                 "-vframes",
                 "1",
                 "-vf",
-                "scale=160:160:force_original_aspect_ratio=increase,crop=160:160",
+                &vf,
                 "-q:v",
-                "5",
+                "9",
             ])
             .arg(&out)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        if !ok || std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) == 0 {
-            std::fs::remove_dir_all(&dir).ok();
-            return None;
+        // Tolerant: reuse the previous good frame (or black) instead of
+        // scrapping the whole mosaic when one seek fails.
+        if ok {
+            if let Ok(img) = image::open(&out) {
+                let cell = img.to_rgb8();
+                if cell.width() == MOSAIC_CELL && cell.height() == MOSAIC_CELL {
+                    cells.push(cell);
+                    good += 1;
+                    continue;
+                }
+            }
         }
-        cells.push(out);
+        cells.push(cells.last().cloned().unwrap_or_else(mosaic_black_cell));
     }
-    let mut canvas = image::RgbImage::new(480, 320);
-    for (i, p) in cells.iter().enumerate() {
-        let cell = image::open(p).ok()?.to_rgb8();
-        if cell.width() != 160 || cell.height() != 160 {
-            std::fs::remove_dir_all(&dir).ok();
-            return None;
-        }
-        image::imageops::replace(&mut canvas, &cell, ((i % 3) * 160) as i64, ((i / 3) * 160) as i64);
-    }
-    let mosaic_path = dir.join("mosaic.jpg");
-    image::DynamicImage::ImageRgb8(canvas).save(&mosaic_path).ok()?;
-    let bytes = std::fs::read(&mosaic_path).ok()?;
     std::fs::remove_dir_all(&dir).ok();
-    if bytes.is_empty() {
+    if good == 0 {
         return None;
     }
-    Some(bytes)
+    encode_mosaic_jpeg(&cells)
 }
 
 /// Mosaic engine 2: 6 mpv screenshots at evenly spaced percents of the
 /// video, square-cropped in-process. Needs only mpv (no ffprobe/ffmpeg).
+/// Screenshots are pre-scaled to 640px wide (less to write/decode) and
+/// kept in memory — no intermediate cell files, no re-read of the mosaic.
 fn grab_mosaic_mpv(input: &str) -> Option<Vec<u8>> {
     let dir = std::env::temp_dir().join(format!("scwoll-mosaic-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).ok()?;
-    let mut cells: Vec<PathBuf> = vec![];
+    let mut cells: Vec<image::RgbImage> = Vec::with_capacity(6);
+    let mut good = 0;
     for i in 0..6 {
-        let pct = (i as f64 + 0.5) / 6.0 * 100.0;
+        // same endpoint-inclusive spacing as the ffmpeg engine, in percent:
+        // first cell ~first second, last cell ~last second.
+        let pct = 0.5 + i as f64 * 99.0 / 5.0;
         let celldir = dir.join(format!("c{i}"));
         std::fs::create_dir_all(&celldir).ok()?;
         let ok = Command::new("mpv")
@@ -387,11 +457,12 @@ fn grab_mosaic_mpv(input: &str) -> Option<Vec<u8>> {
             .arg("--really-quiet")
             .arg("--no-audio")
             .arg("--frames=1")
-            .arg("--network-timeout=15")
+            .arg("--network-timeout=10")
             .arg(format!("--start={pct:.2}%"))
             .arg("--vo=image")
             .arg("--vo-image-format=jpg")
-            .arg("--vo-image-jpeg-quality=75")
+            .arg("--vo-image-jpeg-quality=60")
+            .arg("--vf=scale=640:-2")
             .arg(format!("--vo-image-outdir={}", celldir.display()))
             .arg(input)
             .output()
@@ -408,35 +479,34 @@ fn grab_mosaic_mpv(input: &str) -> Option<Vec<u8>> {
             })
             .flatten();
         match shot {
-            // square-crop the screenshot to a 160x160 cell in-process
-            Some(p) => {
-                let sq = image::open(&p)
-                    .ok()?
-                    .resize_to_fill(160, 160, image::imageops::FilterType::Triangle);
-                let cell = dir.join(format!("cell{i}.jpg"));
-                sq.save(&cell).ok()?;
-                cells.push(cell);
-            }
+            // square-crop the screenshot to a 120x120 cell in-process,
+            // keeping the decoded pixels — no cell file round-trip.
+            Some(p) => match image::open(&p) {
+                Ok(img) => {
+                    let sq = img.resize_to_fill(
+                        MOSAIC_CELL,
+                        MOSAIC_CELL,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    cells.push(sq.to_rgb8());
+                    good += 1;
+                }
+                Err(_) => {
+                    eprintln!("[scwoll] thumb: mpv shot {i}/6 decode failed for {input}");
+                    cells.push(cells.last().cloned().unwrap_or_else(mosaic_black_cell));
+                }
+            },
             None => {
                 eprintln!("[scwoll] thumb: mpv shot {i}/6 failed for {input}");
-                std::fs::remove_dir_all(&dir).ok();
-                return None;
+                cells.push(cells.last().cloned().unwrap_or_else(mosaic_black_cell));
             }
         }
     }
-    let mut canvas = image::RgbImage::new(480, 320);
-    for (i, p) in cells.iter().enumerate() {
-        let cell = image::open(p).ok()?.to_rgb8();
-        image::imageops::replace(&mut canvas, &cell, ((i % 3) * 160) as i64, ((i / 3) * 160) as i64);
-    }
-    let mosaic_path = dir.join("mosaic.jpg");
-    image::DynamicImage::ImageRgb8(canvas).save(&mosaic_path).ok()?;
-    let bytes = std::fs::read(&mosaic_path).ok()?;
     std::fs::remove_dir_all(&dir).ok();
-    if bytes.is_empty() {
+    if good == 0 {
         return None;
     }
-    Some(bytes)
+    encode_mosaic_jpeg(&cells)
 }
 
 fn load_thumb_bytes(v: &Video) -> Option<Vec<u8>> {
@@ -529,6 +599,7 @@ struct ScwollApp {
     in_url_title: String,
     in_bulk: String,
     in_bulk_cat: String,
+    bulk_pin_end: bool,
     in_folder: String,
     in_folder_cat: String,
     in_recursive: bool,
@@ -537,9 +608,10 @@ struct ScwollApp {
     edit_cat: String,
     player: Player,
     toast: Option<(String, Instant)>,
-    // thumbnails
-    thumb_tx: Sender<ThumbMsg>,
+    // thumbnails: `thumb_job_tx` is the FIFO queue, drained one-at-a-time
+    // by a single background worker; `thumb_rx` carries results back.
     thumb_rx: Receiver<ThumbMsg>,
+    thumb_job_tx: Sender<Video>,
     thumb_cache: HashMap<String, egui::TextureHandle>,
     thumb_pending: HashSet<String>,
 }
@@ -547,6 +619,20 @@ struct ScwollApp {
 impl ScwollApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
+        let (job_tx, job_rx) = channel::<Video>();
+        // Single worker: pulls queued videos one at a time so expensive
+        // fallback work (ffmpeg/mpv mosaics) never runs in parallel.
+        std::thread::spawn(move || {
+            while let Ok(vid) = job_rx.recv() {
+                let msg = match load_thumb_bytes(&vid).and_then(|b| decode_thumb_bytes(&b)) {
+                    Some(image) => ThumbMsg::Done { key: vid.id, image },
+                    None => ThumbMsg::Failed { key: vid.id },
+                };
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             videos: load_videos(),
             theme: load_theme(),
@@ -562,6 +648,7 @@ impl ScwollApp {
             in_url_title: String::new(),
             in_bulk: String::new(),
             in_bulk_cat: String::new(),
+            bulk_pin_end: false,
             in_folder: String::new(),
             in_folder_cat: String::new(),
             in_recursive: true,
@@ -569,8 +656,8 @@ impl ScwollApp {
             edit_cat: String::new(),
             player: Player::new(),
             toast: None,
-            thumb_tx: tx,
             thumb_rx: rx,
+            thumb_job_tx: job_tx,
             thumb_cache: HashMap::new(),
             thumb_pending: HashSet::new(),
         }
@@ -641,16 +728,10 @@ impl ScwollApp {
         if self.thumb_cache.contains_key(&v.id) || self.thumb_pending.contains(&v.id) {
             return;
         }
+        // Queue instead of spawning per-video: the single worker above
+        // processes this list strictly one at a time, in import order.
         self.thumb_pending.insert(v.id.clone());
-        let tx = self.thumb_tx.clone();
-        let vid = v.clone();
-        std::thread::spawn(move || {
-            let msg = match load_thumb_bytes(&vid).and_then(|b| decode_thumb_bytes(&b)) {
-                Some(image) => ThumbMsg::Done { key: vid.id, image },
-                None => ThumbMsg::Failed { key: vid.id },
-            };
-            tx.send(msg).ok();
-        });
+        self.thumb_job_tx.send(v.clone()).ok();
     }
 
     // ---------------- imports ----------------
@@ -1160,6 +1241,7 @@ impl ScwollApp {
             .open(&mut open)
             .resizable(true)
             .default_width(480.0)
+            .max_height(560.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.import_tab, ImportTab::Url, "Single URL");
@@ -1189,8 +1271,42 @@ impl ScwollApp {
                         }
                     }
                     ImportTab::List => {
-                        ui.label("Paste URLs (one per line) or load a .txt file. # = comment.");
-                        ui.add(egui::TextEdit::multiline(&mut self.in_bulk).hint_text("https://…\nhttps://…").desired_rows(6).desired_width(f32::INFINITY));
+                        ui.label("Paste URLs (separated by lines, spaces or commas) or load a .txt file. # = comment.");
+                        // compact 3-row box pinned to the END so huge lists stay usable
+                        if self.bulk_pin_end {
+                            self.bulk_pin_end = false;
+                            let end = self.in_bulk.chars().count();
+                            let sid = ui.make_persistent_id(egui::Id::new("bulk_urls"));
+                            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), sid) {
+                                st.set_ccursor_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(end),
+                                )));
+                                egui::TextEdit::store_state(ui.ctx(), sid, st);
+                            }
+                        }
+                        // FIXED 3-row-high scroll box: egui's TextEdit always sizes
+                        // to its FULL text (desired_rows is only a minimum), so the
+                        // only way to cap it is an outer ScrollArea with max_height.
+                        // stick_to_bottom keeps the tail (last 3 lines) in view.
+                        let box_h =
+                            ui.text_style_height(&egui::TextStyle::Body) * 3.0 + 12.0;
+                        egui::ScrollArea::vertical()
+                            .id_source("bulk_scroll")
+                            .max_height(box_h)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.in_bulk)
+                                        .hint_text("https://… https://…\nhttps://…")
+                                        .desired_width(f32::INFINITY)
+                                        .id_source("bulk_urls"),
+                                );
+                            });
+                        ui.small(format!(
+                            "{} in box · {} look like urls",
+                            self.in_bulk.lines().filter(|l| !l.trim().is_empty()).count(),
+                            split_url_list(&self.in_bulk).len()
+                        ));
                         ui.horizontal(|ui| {
                             ui.label("Category:");
                             ui.add(egui::TextEdit::singleline(&mut self.in_bulk_cat).hint_text("General").desired_width(140.0));
@@ -1201,6 +1317,7 @@ impl ScwollApp {
                                             self.in_bulk.push('\n');
                                         }
                                         self.in_bulk.push_str(&content);
+                                        self.bulk_pin_end = true; // jump the 3-row box to the new tail
                                         self.toast(format!("Loaded {}", path.display()));
                                     }
                                 }
@@ -1365,20 +1482,26 @@ mod thumb_tests {
         assert!((dur - 12.0).abs() < 1.0, "dur={dur}");
         let bytes = grab_mosaic_bytes(vid.to_str().unwrap()).expect("no mosaic");
         let img = image::load_from_memory(&bytes).expect("bad jpeg");
-        assert_eq!((img.width(), img.height()), (480, 320));
+        assert_eq!((img.width(), img.height()), (360, 240));
         // decode must preserve the full mosaic (no 16:9 crop eating rows)
         let decoded = decode_thumb_bytes(&bytes).expect("no decode");
-        assert_eq!(decoded.size, [480, 320]);
+        assert_eq!(decoded.size, [360, 240]);
         // the 6 cells must actually differ (frames spread across time)
         let px = |cx: usize, cy: usize| {
-            let c = decoded.pixels[cy * 480 + cx];
+            let c = decoded.pixels[cy * 360 + cx];
             (c.r(), c.g(), c.b())
         };
         let mut cells = std::collections::HashSet::new();
         for c in 0..6 {
-            cells.insert(px((c % 3) * 160 + 80, (c / 3) * 160 + 80));
+            cells.insert(px((c % 3) * 120 + 60, (c / 3) * 120 + 60));
         }
         assert!(cells.len() >= 5, "cells not spread across video: {cells:?}");
+        // endpoints: first cell from the first second (red), last cell from
+        // the last second (cyan) — in the right order, not clustered.
+        let first = px(60, 60);
+        let last = px(2 * 120 + 60, 120 + 60);
+        assert!(first.0 > first.1 && first.0 > first.2, "first cell not red: {first:?}");
+        assert!(last.1 > last.0 && last.2 > last.0, "last cell not cyan: {last:?}");
         std::fs::remove_file(&vid).ok();
     }
 }

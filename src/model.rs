@@ -314,10 +314,19 @@ pub fn make_video_from_file(path: &std::path::Path, category: String) -> Video {
 }
 
 /// Split pasted / file text content into clean URLs (supports # comments).
+/// Separators: newlines, spaces, tabs, commas, semicolons, pipes — plus
+/// trailing sentence punctuation ("see https://a.com/x.mp4." still parses).
+/// Split on `.` itself is deliberately NOT done: dots live inside every URL.
+/// Filter keeps anything URL-shaped and drops prose around it.
 pub fn split_url_list(text: &str) -> Vec<String> {
-    text.lines()
-        .flat_map(|l| l.split([',', ';', ' ', '\t']))
-        .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'' || c == '<' || c == '>'))
+    text.split(|c: char| c == ',' || c == ';' || c == '|' || c.is_whitespace())
+        .map(|s| {
+            s.trim()
+                .trim_matches(|c| {
+                    c == '"' || c == '\'' || c == '<' || c == '>' || c == '(' || c == ')' || c == '[' || c == ']'
+                })
+                .trim_end_matches(|c| c == '.' || c == '!' || c == '?')
+        })
         .filter(|s| !s.is_empty() && !s.starts_with('#'))
         .filter(|s| s.contains("://") || s.contains("www.") || s.contains("youtu"))
         .map(|s| s.to_string())
@@ -379,6 +388,12 @@ mod tests {
     fn url_list_split() {
         let urls = split_url_list("https://a.com/1.mp4\n# comment\nhttps://youtu.be/dQw4w9WgXcQ");
         assert_eq!(urls.len(), 2);
+        // commas, spaces, pipes, trailing periods
+        let urls = split_url_list("https://a.com/1.mp4, https://b.com/2.mp4 https://c.com/3.mp4|https://d.com/4.mp4.");
+        assert_eq!(urls.len(), 4);
+        // sentence-wrapped url
+        let urls = split_url_list("watch this: https://youtu.be/dQw4w9WgXcQ. so good!");
+        assert_eq!(urls, vec!["https://youtu.be/dQw4w9WgXcQ".to_string()]);
     }
 
     #[test]
