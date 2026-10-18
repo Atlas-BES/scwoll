@@ -103,11 +103,10 @@ fn placeholder_color(key: &str) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
-/// Shorten a title to roughly two lines at the given card width so every
-/// box stays the same height and shelf rows line up evenly.
-fn shorten_title(title: &str, card_w: f32) -> String {
-    let per_line = (card_w / 7.0).floor() as usize;
-    let max = (per_line * 2).max(20);
+/// Shorten a title to a single line at the given content width so cards
+/// stay compact and shelf rows line up evenly.
+fn shorten_title(title: &str, content_w: f32) -> String {
+    let max = ((content_w / 7.0).floor() as usize).max(16);
     let chars: Vec<char> = title.chars().collect();
     if chars.len() <= max {
         title.to_string()
@@ -441,70 +440,82 @@ fn grab_mosaic_ffmpeg(input: &str) -> Option<Vec<u8>> {
 /// video, square-cropped in-process. Needs only mpv (no ffprobe/ffmpeg).
 /// Screenshots are pre-scaled to 640px wide (less to write/decode) and
 /// kept in memory — no intermediate cell files, no re-read of the mosaic.
+/// All 6 shots run in parallel threads; if the FIRST shot fails the video
+/// is skipped outright (dead/unreadable source — no point running the rest).
+/// Other failed frames reuse the previous good one (or black).
+fn mpv_shot(input: &str, pct: f64, celldir: &Path) -> Option<image::RgbImage> {
+    std::fs::create_dir_all(celldir).ok()?;
+    let ok = Command::new("mpv")
+        .arg("--no-terminal")
+        .arg("--really-quiet")
+        .arg("--no-audio")
+        .arg("--frames=1")
+        .arg("--network-timeout=10")
+        .arg(format!("--start={pct:.2}%"))
+        .arg("--vo=image")
+        .arg("--vo-image-format=jpg")
+        .arg("--vo-image-jpeg-quality=60")
+        .arg("--vf=scale=640:-2")
+        .arg(format!("--vo-image-outdir={}", celldir.display()))
+        .arg(input)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let shot = ok
+        .then(|| {
+            std::fs::read_dir(celldir).ok()?.flatten().map(|e| e.path()).find(|p| {
+                p.extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("jpg"))
+                    .unwrap_or(false)
+            })
+        })
+        .flatten()?;
+    // square-crop the screenshot to a 120x120 cell in-process,
+    // keeping the decoded pixels — no cell file round-trip.
+    let img = image::open(&shot).ok()?;
+    Some(
+        img.resize_to_fill(MOSAIC_CELL, MOSAIC_CELL, image::imageops::FilterType::Triangle)
+            .to_rgb8(),
+    )
+}
+
 fn grab_mosaic_mpv(input: &str) -> Option<Vec<u8>> {
     let dir = std::env::temp_dir().join(format!("scwoll-mosaic-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).ok()?;
-    let mut cells: Vec<image::RgbImage> = Vec::with_capacity(6);
-    let mut good = 0;
-    for i in 0..6 {
-        // same endpoint-inclusive spacing as the ffmpeg engine, in percent:
-        // first cell ~first second, last cell ~last second.
-        let pct = 0.5 + i as f64 * 99.0 / 5.0;
-        let celldir = dir.join(format!("c{i}"));
-        std::fs::create_dir_all(&celldir).ok()?;
-        let ok = Command::new("mpv")
-            .arg("--no-terminal")
-            .arg("--really-quiet")
-            .arg("--no-audio")
-            .arg("--frames=1")
-            .arg("--network-timeout=10")
-            .arg(format!("--start={pct:.2}%"))
-            .arg("--vo=image")
-            .arg("--vo-image-format=jpg")
-            .arg("--vo-image-jpeg-quality=60")
-            .arg("--vf=scale=640:-2")
-            .arg(format!("--vo-image-outdir={}", celldir.display()))
-            .arg(input)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let shot = ok
-            .then(|| {
-                std::fs::read_dir(&celldir).ok()?.flatten().map(|e| e.path()).find(|p| {
-                    p.extension()
-                        .and_then(|x| x.to_str())
-                        .map(|x| x.eq_ignore_ascii_case("jpg"))
-                        .unwrap_or(false)
-                })
+    // same endpoint-inclusive spacing as the ffmpeg engine, in percent:
+    // first cell ~first second, last cell ~last second.
+    let pcts: Vec<f64> = (0..6).map(|i| 0.5 + i as f64 * 99.0 / 5.0).collect();
+    let mut shots: Vec<Option<image::RgbImage>> = vec![None, None, None, None, None, None];
+    std::thread::scope(|s| {
+        let handles: Vec<_> = pcts
+            .iter()
+            .enumerate()
+            .map(|(i, &pct)| {
+                let celldir = dir.join(format!("c{i}"));
+                s.spawn(move || mpv_shot(input, pct, &celldir))
             })
-            .flatten();
-        match shot {
-            // square-crop the screenshot to a 120x120 cell in-process,
-            // keeping the decoded pixels — no cell file round-trip.
-            Some(p) => match image::open(&p) {
-                Ok(img) => {
-                    let sq = img.resize_to_fill(
-                        MOSAIC_CELL,
-                        MOSAIC_CELL,
-                        image::imageops::FilterType::Triangle,
-                    );
-                    cells.push(sq.to_rgb8());
-                    good += 1;
-                }
-                Err(_) => {
-                    eprintln!("[scwoll] thumb: mpv shot {i}/6 decode failed for {input}");
-                    cells.push(cells.last().cloned().unwrap_or_else(mosaic_black_cell));
-                }
-            },
-            None => {
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            shots[i] = h.join().ok().flatten();
+            if shots[i].is_none() {
                 eprintln!("[scwoll] thumb: mpv shot {i}/6 failed for {input}");
-                cells.push(cells.last().cloned().unwrap_or_else(mosaic_black_cell));
             }
         }
-    }
+    });
     std::fs::remove_dir_all(&dir).ok();
-    if good == 0 {
+    // First shot failed: the source is dead — skip the video entirely.
+    if shots[0].is_none() {
+        eprintln!("[scwoll] thumb: mpv first shot failed for {input} (skipping)");
         return None;
+    }
+    // shots[0] is good, so `cells.last()` always exists for gaps below.
+    let mut cells: Vec<image::RgbImage> = Vec::with_capacity(6);
+    for shot in shots {
+        match shot {
+            Some(cell) => cells.push(cell),
+            None => cells.push(cells.last().cloned().unwrap_or_else(mosaic_black_cell)),
+        }
     }
     encode_mosaic_jpeg(&cells)
 }
@@ -516,6 +527,11 @@ fn load_thumb_bytes(v: &Video) -> Option<Vec<u8>> {
             return Some(b);
         }
     }
+    // Failed recently (unplayable/dead source)? Don't burn mpv runs every
+    // launch — the cooldown marker says when it's worth retrying.
+    if thumb_failed_recently(&v.id) {
+        return None;
+    }
     // YouTube thumbnail image
     if !v.thumbnail.is_empty() {
         if let Some(b) = download_bytes(&v.thumbnail) {
@@ -523,6 +539,7 @@ fn load_thumb_bytes(v: &Video) -> Option<Vec<u8>> {
                 std::fs::create_dir_all(parent).ok();
             }
             std::fs::write(&cache, &b).ok();
+            std::fs::remove_file(thumb_failed_file(&v.id)).ok();
             return Some(b);
         }
     }
@@ -540,10 +557,47 @@ fn load_thumb_bytes(v: &Video) -> Option<Vec<u8>> {
             std::fs::create_dir_all(parent).ok();
         }
         std::fs::write(&cache, &b).ok();
+        std::fs::remove_file(thumb_failed_file(&v.id)).ok();
         return Some(b);
     }
+    // Total failure: stamp a cooldown marker so the next launches use the
+    // letter tile instead of re-running doomed ffmpeg/mpv work.
+    mark_thumb_failed(&v.id);
     eprintln!("[scwoll] thumb: no artwork and no mosaic for {input} (keeps letter tile)");
     None
+}
+
+/// Cooldown before retrying a video whose thumbnail failed completely.
+const THUMB_FAIL_RETRY_SECS: u64 = 24 * 3600;
+
+fn thumb_failed_file(key: &str) -> PathBuf {
+    data_dir().join("thumbs").join(format!("{key}.failed"))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn thumb_failed_recently(key: &str) -> bool {
+    let s = match std::fs::read_to_string(thumb_failed_file(key)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match s.trim().parse::<u64>() {
+        Ok(ts) => now_secs().saturating_sub(ts) < THUMB_FAIL_RETRY_SECS,
+        Err(_) => false,
+    }
+}
+
+fn mark_thumb_failed(key: &str) {
+    let p = thumb_failed_file(key);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&p, now_secs().to_string()).ok();
 }
 
 // use Read trait in fetch
@@ -608,31 +662,68 @@ struct ScwollApp {
     edit_cat: String,
     player: Player,
     toast: Option<(String, Instant)>,
-    // thumbnails: `thumb_job_tx` is the FIFO queue, drained one-at-a-time
-    // by a single background worker; `thumb_rx` carries results back.
+    // thumbnails: `thumb_job_tx` is the FIFO queue, drained by a pool of
+    // background workers sized from free RAM; `thumb_rx` carries results.
     thumb_rx: Receiver<ThumbMsg>,
     thumb_job_tx: Sender<Video>,
     thumb_cache: HashMap<String, egui::TextureHandle>,
     thumb_pending: HashSet<String>,
 }
 
+/// Free RAM in bytes (Linux: MemAvailable from /proc/meminfo).
+fn free_ram_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// How many video thumbnail jobs to run at once: one per ~2 GiB of free
+/// RAM (a job can hold 6 mpv children in flight), clamped to 1..=4 so a
+/// big machine doesn't fork-bomb itself. Falls back to CPU count.
+fn thumb_worker_count() -> usize {
+    const PER_TASK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    match free_ram_bytes() {
+        Some(free) => ((free / PER_TASK_BYTES) as usize).clamp(1, 4),
+        None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(1, 4),
+    }
+}
+
 impl ScwollApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
         let (job_tx, job_rx) = channel::<Video>();
-        // Single worker: pulls queued videos one at a time so expensive
-        // fallback work (ffmpeg/mpv mosaics) never runs in parallel.
-        std::thread::spawn(move || {
-            while let Ok(vid) = job_rx.recv() {
+        // Worker pool sharing one queue: N videos at a time, N from free
+        // RAM. The mutex is only held for the recv itself, never while a
+        // thumbnail is being built.
+        let jobs = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let n_workers = thumb_worker_count();
+        eprintln!("[scwoll] thumb: {n_workers} parallel video tasks");
+        for _ in 0..n_workers {
+            let jobs = jobs.clone();
+            let out = tx.clone();
+            std::thread::spawn(move || loop {
+                let vid: Video = match jobs.lock().ok().and_then(|q| q.recv().ok()) {
+                    Some(v) => v,
+                    None => break,
+                };
                 let msg = match load_thumb_bytes(&vid).and_then(|b| decode_thumb_bytes(&b)) {
                     Some(image) => ThumbMsg::Done { key: vid.id, image },
                     None => ThumbMsg::Failed { key: vid.id },
                 };
-                if tx.send(msg).is_err() {
+                if out.send(msg).is_err() {
                     break;
                 }
-            }
-        });
+            });
+        }
+        drop(tx);
         Self {
             videos: load_videos(),
             theme: load_theme(),
@@ -728,8 +819,8 @@ impl ScwollApp {
         if self.thumb_cache.contains_key(&v.id) || self.thumb_pending.contains(&v.id) {
             return;
         }
-        // Queue instead of spawning per-video: the single worker above
-        // processes this list strictly one at a time, in import order.
+        // Queue instead of spawning per-video: the worker pool above
+        // drains this list, N videos at a time based on free RAM.
         self.thumb_pending.insert(v.id.clone());
         self.thumb_job_tx.send(v.clone()).ok();
     }
@@ -869,6 +960,9 @@ impl eframe::App for ScwollApp {
             .exact_width(228.0)
             .frame(egui::Frame::side_top_panel(&ctx.style()).fill(sidebar_fill))
             .show(ctx, |ui| {
+                // One scrollbar for the whole sidebar: categories scroll with
+                // the sidebar instead of trapping scroll in a nested box.
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.heading("Library");
                 for s in [SourceFilter::All, SourceFilter::Youtube, SourceFilter::Local, SourceFilter::Direct] {
                     let label = match s {
@@ -885,8 +979,7 @@ impl eframe::App for ScwollApp {
                 ui.separator();
                 ui.heading("Categories");
                 let cats = self.categories();
-                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    if ui.selectable_label(self.active_category == "All", format!("All ({})", self.videos.len())).clicked() {
+                if ui.selectable_label(self.active_category == "All", format!("All ({})", self.videos.len())).clicked() {
                         self.active_category = "All".into();
                     }
                     for (name, count) in &cats {
@@ -897,7 +990,6 @@ impl eframe::App for ScwollApp {
                     if cats.is_empty() {
                         ui.label(egui::RichText::new("No categories yet — import something!").color(muted).small());
                     }
-                });
                 ui.separator();
                 let (yt, lo, di) = (
                     self.videos.iter().filter(|v| v.kind == VideoKind::Youtube).count(),
@@ -906,6 +998,7 @@ impl eframe::App for ScwollApp {
                 );
                 ui.small(format!("📼 {} total · ▶ {yt} · 🗂 {lo} · 🔗 {di}", self.videos.len()));
                 ui.small(format!("Player: {}", if self.player.child.is_some() { "busy" } else { "idle" }));
+                });
             });
 
         // ---------------- main ----------------
@@ -942,20 +1035,8 @@ impl eframe::App for ScwollApp {
 // ----------------------------------------------------------------- views --
 impl ScwollApp {
     fn show_grid(&mut self, ui: &mut egui::Ui, accent: egui::Color32, muted: egui::Color32) {
-        // chips
-        let mut cats: Vec<String> = vec!["All".into()];
-        cats.extend(self.categories().into_iter().map(|(n, _)| n));
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for c in &cats {
-                    if ui.selectable_label(&self.active_category == c, c).clicked() {
-                        self.active_category = c.clone();
-                    }
-                }
-            });
-        });
-        ui.separator();
-
+        // Categories live in the sidebar — no duplicate category row here
+        // eating vertical space or stealing scroll.
         let list: Vec<Video> = self.filtered().into_iter().cloned().collect();
         ui.horizontal(|ui| {
             ui.heading(if self.active_category == "All" { self.source.label() } else { self.active_category.as_str() });
@@ -975,16 +1056,29 @@ impl ScwollApp {
         }
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // wrapping flow: cards that don't fit flow onto the next row,
-            // so nothing ever runs off the window edge.
-            let avail = ui.available_width();
-            let card_w = (300.0 * self.theme.card_scale).clamp(140.0, avail.max(140.0));
-            let thumb_size = egui::vec2(card_w, card_w * 9.0 / 16.0);
+            // Responsive shelf: fit as many columns as the window holds at
+            // the target width, then stretch cards to fill each row exactly.
+            // Columns always fit — nothing runs off the right edge.
+            let avail = ui.available_width().max(120.0);
+            let gap = egui::vec2(10.0, 10.0);
+            let target = (220.0 * self.theme.card_scale).clamp(140.0, 320.0);
+            let cols = (((avail + gap.x) / (target + gap.x)).floor() as usize).max(1);
+            let card_w =
+                ((avail - gap.x * (cols.saturating_sub(1) as f32)) / cols as f32).max(110.0);
+            // Frame adds 6px inner margin per side + ~1px stroke each side.
+            let content_w = (card_w - 14.0).max(80.0);
+            let slot_h = content_w * 9.0 / 16.0;
             let rounding = egui::Rounding::same(self.theme.radius.min(20) as f32);
 
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(10.0, 12.0);
-                for v in list.iter() {
+            // Explicit grid rows: exactly `cols` cards per row, rows stacked
+            // vertically inside the scroll area. No wrap heuristics — the
+            // list fills vertical space and scrolls instead of snaking off
+            // the right edge where it can't be reached.
+            ui.spacing_mut().item_spacing.y = gap.y;
+            for chunk in list.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap.x;
+                    for v in chunk.iter() {
                         let vid = v.clone();
                         self.request_thumb(v);
                         let mut opened = false;
@@ -998,14 +1092,18 @@ impl ScwollApp {
                             .rounding(rounding)
                             .inner_margin(egui::Margin::same(6.0))
                             .show(ui, |ui| {
-                                ui.set_width(card_w);
+                                // Pin the content width so the card (content +
+                                // margins) is exactly card_w — the wrapping row
+                                // can never push it past the window edge.
+                                ui.set_min_width(content_w);
+                                ui.set_max_width(content_w);
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 // Force vertical stacking inside the box: the wrapping
                                 // row outside hands down a HORIZONTAL layout, which is
                                 // what glued the buttons beside the thumbnail and threw
                                 // the second box lower (rows center uneven heights).
                                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                ui.set_width(card_w);
+                                // (width already pinned above; no second set_width)
                                 let src = match vid.kind {
                                     VideoKind::Youtube => "\u{25b6} YouTube",
                                     VideoKind::Local => "\u{1F5C2} Local",
@@ -1024,20 +1122,16 @@ impl ScwollApp {
                                     );
                                 });
                                 ui.add_space(2.0);
-                                // thumbnail (click to open); shown aspect-correct so the
-                                // 3:2 frame mosaic isn't stretched into the 16:9 slot.
+                                // thumbnail (click to open); aspect-fit into the
+                                // 16:9 slot. The box is only as tall as the
+                                // fitted image, so no dead space sits below it.
                                 let thumb_clicked = if let Some(tex) = self.thumb_cache.get(&vid.id) {
                                     let ts = tex.size();
-                                    let ts = egui::vec2(ts[0] as f32, ts[1].max(1) as f32);
-                                    let s = (ts.x / ts.y.max(1.0)).clamp(0.2, 4.0);
-                                    let slot_s = thumb_size.x / thumb_size.y;
-                                    let disp = if s > slot_s {
-                                        egui::vec2(thumb_size.x, thumb_size.x / s)
-                                    } else {
-                                        egui::vec2(thumb_size.y * s, thumb_size.y)
-                                    };
+                                    let s = (ts[0] as f32 / ts[1].max(1) as f32).clamp(0.2, 4.0);
+                                    let disp_w = (slot_h * s).min(content_w);
+                                    let disp = egui::vec2(disp_w.max(20.0), (disp_w / s).max(10.0));
                                     ui.allocate_ui_with_layout(
-                                        thumb_size,
+                                        egui::vec2(content_w, disp.y),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
                                             ui.add(
@@ -1058,10 +1152,10 @@ impl ScwollApp {
                                         .to_uppercase()
                                         .to_string();
                                     ui.add_sized(
-                                        thumb_size,
+                                        egui::vec2(content_w, slot_h),
                                         egui::Button::new(
                                             egui::RichText::new(letter)
-                                                .size(44.0)
+                                                .size(36.0)
                                                 .color(egui::Color32::WHITE),
                                         )
                                         .fill(placeholder_color(&vid.id)),
@@ -1071,15 +1165,15 @@ impl ScwollApp {
                                 if thumb_clicked {
                                     opened = true;
                                 }
-                                // one horizontal button row directly under the image;
-                                // exact thirds of the available width so it always fits.
-                                ui.add_space(6.0);
-                                let gap = ui.spacing().item_spacing.x;
-                                let bw = (ui.available_width() - gap * 2.0) / 3.0;
+                                // one compact button row directly under the image;
+                                // exact thirds of the content width so it fits.
+                                ui.add_space(2.0);
+                                let bw = (content_w - gap.x * 2.0) / 3.0;
                                 ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = gap.x;
                                     if ui
                                         .add_sized(
-                                            egui::vec2(bw, 24.0),
+                                            egui::vec2(bw, 22.0),
                                             egui::Button::new(
                                                 egui::RichText::new("\u{25b6} Play")
                                                     .color(egui::Color32::WHITE),
@@ -1091,33 +1185,24 @@ impl ScwollApp {
                                         play = true;
                                     }
                                     if ui
-                                        .add_sized(egui::vec2(bw, 24.0), egui::Button::new("Open"))
+                                        .add_sized(egui::vec2(bw, 22.0), egui::Button::new("Open"))
                                         .clicked()
                                     {
                                         opened = true;
                                     }
                                     if ui
-                                        .add_sized(egui::vec2(bw, 24.0), egui::Button::new("\u{1F5D1}"))
+                                        .add_sized(egui::vec2(bw, 22.0), egui::Button::new("\u{1F5D1}"))
                                         .on_hover_text("Delete")
                                         .clicked()
                                     {
                                         delete = true;
                                     }
                                 });
-                                // title: fixed-height box so every card is exactly
-                                // the same height — shelf rows stay level, nothing
-                                // shifts down.
-                                ui.add_space(4.0);
-                                let title_w = ui.available_width().max(50.0);
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(title_w, 36.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(shorten_title(&vid.title, card_w))
-                                                .strong(),
-                                        );
-                                    },
+                                // title: one truncated line — compact, and every
+                                // card stays the same height so rows line up.
+                                ui.label(
+                                    egui::RichText::new(shorten_title(&vid.title, content_w))
+                                        .strong(),
                                 );
                                 });
                             });
@@ -1135,7 +1220,8 @@ impl ScwollApp {
                             self.persist();
                         }
                     }
-                });
+                    });
+            }
         });
     }
 
