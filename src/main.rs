@@ -1,5 +1,5 @@
 //! Scwoll — native YouTube-style media player in Rust. No browser, no server.
-//! Library (URLs / .txt lists / folders) + categories + glass/minimal themes.
+//! Library (URLs / .txt lists / folders) + categories + liquid glass theme.
 //! Playback is handled by mpv (must be installed), controlled from this UI.
 
 mod model;
@@ -44,10 +44,18 @@ fn save_videos(videos: &[Video]) {
     }
 }
 fn load_theme() -> Theme {
-    std::fs::read_to_string(theme_path())
+    let mut theme: Theme = std::fs::read_to_string(theme_path())
         .ok()
         .and_then(|s| serde_json::from_str::<Theme>(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Liquid glass is the only theme: pin it and migrate old saves
+    // (old default red accent -> cerulean).
+    theme.style = "glass".into();
+    if theme.accent.eq_ignore_ascii_case("#ff0033") {
+        theme.accent = Theme::default().accent;
+    }
+    save_theme(&theme);
+    theme
 }
 fn save_theme(theme: &Theme) {
     if let Ok(s) = serde_json::to_string_pretty(theme) {
@@ -117,7 +125,7 @@ fn shorten_title(title: &str, content_w: f32) -> String {
 
 
 fn apply_visuals(ctx: &egui::Context, theme: &Theme) {
-    let glass = theme.style == "glass";
+    let glass = true; // liquid glass is the only theme
     let accent = hex_to_color(&theme.accent);
     let bg = hex_to_color(&theme.background);
     let surface = hex_to_color(&theme.surface);
@@ -924,7 +932,7 @@ impl eframe::App for ScwollApp {
         self.pump_thumbs(ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        let glass = self.theme.style == "glass";
+        let glass = true; // liquid glass is the only theme
         let accent = hex_to_color(&self.theme.accent);
         let muted = hex_to_color(&self.theme.muted);
         let sidebar_fill = with_alpha(hex_to_color(&self.theme.sidebar), if glass { 215 } else { 255 }, glass);
@@ -1449,16 +1457,6 @@ impl ScwollApp {
             .resizable(true)
             .default_width(420.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(self.theme.style == "glass", "✨ Liquid Glass").clicked() {
-                        self.theme.style = "glass".into();
-                    }
-                    if ui.selectable_label(self.theme.style == "minimal", "◻ Minimal").clicked() {
-                        self.theme.style = "minimal".into();
-                    }
-                });
-                ui.small("Glass = translucent panels + soft shadows. Minimal = opaque + sharp.");
-                ui.separator();
                 // color rows
                 let fields: [(&str, &str); 7] = [
                     ("accent", "Accent"),
@@ -1495,10 +1493,6 @@ impl ScwollApp {
                 ui.horizontal(|ui| {
                     ui.label("Corner radius:");
                     ui.add(egui::Slider::new(&mut self.theme.radius, 0..=24));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Glass glow:");
-                    ui.add(egui::Slider::new(&mut self.theme.blur, 0..=40));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Box size:");

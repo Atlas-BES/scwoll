@@ -37,7 +37,7 @@ fn default_category() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Theme {
     #[serde(default = "default_style")]
-    pub style: String, // "glass" | "minimal"
+    pub style: String, // always "glass" (kept for save-file compat)
     #[serde(default = "c_accent")]
     pub accent: String,
     #[serde(default = "c_bg")]
@@ -64,7 +64,7 @@ fn default_style() -> String {
     "glass".into()
 }
 fn c_accent() -> String {
-    "#ff0033".into()
+    "#007BA7".into() // cerulean blue
 }
 fn c_bg() -> String {
     "#0b0b10".into()
