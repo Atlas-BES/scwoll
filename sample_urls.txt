@@ -1,0 +1,6 @@
+# Scwoll videos — sample import list
+# Lines starting with # are ignored. Paste this into
+# Import → List/.txt, or pick this file directly.
+https://www.youtube.com/watch?v=aqz-KE-bpKQ
+https://www.youtube.com/watch?v=jfKfPfyJRdk
+https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4
