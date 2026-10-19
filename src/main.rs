@@ -668,6 +668,8 @@ struct ScwollApp {
     // theater edit buffers
     edit_title: String,
     edit_cat: String,
+    show_cats: bool,
+    cat_edit_buf: HashMap<String, String>,
     player: Player,
     toast: Option<(String, Instant)>,
     // thumbnails: `thumb_job_tx` is the FIFO queue, drained by a pool of
@@ -753,6 +755,8 @@ impl ScwollApp {
             in_recursive: true,
             edit_title: String::new(),
             edit_cat: String::new(),
+            show_cats: false,
+            cat_edit_buf: HashMap::new(),
             player: Player::new(),
             toast: None,
             thumb_rx: rx,
@@ -775,6 +779,81 @@ impl ScwollApp {
             *map.entry(v.category.clone()).or_default() += 1;
         }
         map.into_iter().collect()
+    }
+
+    /// Delete a video and its cached thumbnail files.
+    /// Removes `data/thumbs/<id>.jpg` + `<id>.failed`, drops any
+    /// in-memory texture / pending job, stops playback of it, persists.
+    fn delete_video(&mut self, id: &str) {
+        if self.player.current_id.as_deref() == Some(id) {
+            self.player.stop();
+        }
+        self.videos.retain(|x| x.id != id);
+        self.thumb_cache.remove(id);
+        self.thumb_pending.remove(id);
+        std::fs::remove_file(thumb_cache_file(id)).ok();
+        std::fs::remove_file(thumb_failed_file(id)).ok();
+        if self.selected.as_deref() == Some(id) {
+            self.selected = None;
+        }
+        if self.active_category != "All"
+            && self.active_category != "Favorites"
+            && !self.videos.iter().any(|v| v.category == self.active_category)
+        {
+            self.active_category = "All".into();
+        }
+        self.persist();
+    }
+
+    /// Change one video's category (normalizes blank -> "General").
+    fn set_video_category(&mut self, id: &str, cat: &str) {
+        let cat = normalize_category(Some(cat.to_string()));
+        if let Some(slot) = self.videos.iter_mut().find(|x| x.id == id) {
+            slot.category = cat;
+        }
+        self.persist();
+    }
+
+    /// Rename a whole category: every video in `old` moves to `new`.
+    /// Returns number of videos moved. No-op (with toast msg) on bad input.
+    fn rename_category(&mut self, old: &str, new: &str) -> Result<usize, String> {
+        let new = normalize_category(Some(new.to_string()));
+        if old == new {
+            return Err("Same name — nothing to do.".into());
+        }
+        if !self.videos.iter().any(|v| v.category == old) {
+            return Err("Category not found.".into());
+        }
+        let mut n = 0;
+        for v in self.videos.iter_mut().filter(|v| v.category == old) {
+            v.category = new.clone();
+            n += 1;
+        }
+        if self.active_category == old {
+            self.active_category = new.clone();
+        }
+        if self.edit_cat == old {
+            self.edit_cat = new.clone();
+        }
+        self.cat_edit_buf.remove(old);
+        self.persist();
+        Ok(n)
+    }
+
+    /// Delete a category: its videos move to "General" (never deleted).
+    /// Returns number of videos moved.
+    fn clear_category(&mut self, cat: &str) -> usize {
+        let mut n = 0;
+        for v in self.videos.iter_mut().filter(|v| v.category == cat) {
+            v.category = "General".into();
+            n += 1;
+        }
+        if self.active_category == cat {
+            self.active_category = "All".into();
+        }
+        self.cat_edit_buf.remove(cat);
+        self.persist();
+        n
     }
 
     fn filtered(&self) -> Vec<&Video> {
@@ -1003,7 +1082,14 @@ impl eframe::App for ScwollApp {
                     }
                 }
                 ui.separator();
-                ui.heading("Categories");
+                ui.horizontal(|ui| {
+                    ui.heading("Categories");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("⚙ Manage").on_hover_text("Rename / move / clear categories").clicked() {
+                            self.show_cats = true;
+                        }
+                    });
+                });
                 let cats = self.categories();
                 if ui.selectable_label(self.active_category == "All", format!("All ({})", self.videos.len())).clicked() {
                         self.active_category = "All".into();
@@ -1046,6 +1132,9 @@ impl eframe::App for ScwollApp {
         if self.show_theme {
             self.theme_window(ctx, accent, muted);
         }
+        if self.show_cats {
+            self.categories_window(ctx, muted);
+        }
 
         // toast
         if let Some((msg, t)) = self.toast.clone() {
@@ -1068,6 +1157,7 @@ impl ScwollApp {
         // Categories live in the sidebar — no duplicate category row here
         // eating vertical space or stealing scroll.
         let list: Vec<Video> = self.filtered().into_iter().cloned().collect();
+        let all_cats: Vec<String> = self.categories().into_iter().map(|(n, _)| n).collect();
         ui.horizontal(|ui| {
             ui.heading(if self.active_category == "All" { self.source.label() } else { self.active_category.as_str() });
             ui.label(egui::RichText::new(format!("{} videos", list.len())).color(muted));
@@ -1120,6 +1210,7 @@ impl ScwollApp {
                         let mut play = false;
                         let mut delete = false;
                         let mut fav_toggle = false;
+                        let mut new_cat: Option<String> = None;
                         // ============ video box ============
                         // stock widgets only: no custom painting, nothing can overlap.
                         // top row (source left, category right) / thumbnail /
@@ -1145,18 +1236,32 @@ impl ScwollApp {
                                     VideoKind::Local => "\u{1F5C2} Local",
                                     VideoKind::Direct => "\u{1F517} Link",
                                 };
-                                // top row of the box: source + category left,
+                                // top row of the box: source + category menu left,
                                 // favorite star right.
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     ui.label(egui::RichText::new(src).color(muted).small());
                                     ui.label(egui::RichText::new("\u{00b7}").color(muted).small());
-                                    ui.label(
-                                        egui::RichText::new(vid.category.clone())
+                                    let cat_resp = ui.menu_button(
+                                        egui::RichText::new(format!("{} ▾", vid.category))
                                             .color(accent)
                                             .small()
                                             .strong(),
+                                        |ui| {
+                                            for c in &all_cats {
+                                                if ui.selectable_label(*c == vid.category, c.clone()).clicked() {
+                                                    new_cat = Some(c.clone());
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                            ui.separator();
+                                            if ui.selectable_label(false, "✎ Edit / new…").clicked() {
+                                                opened = true;
+                                                ui.close_menu();
+                                            }
+                                        },
                                     );
+                                    cat_resp.response.on_hover_text("Change category");
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         let star = if vid.favorite { "★" } else { "☆" };
                                         if ui.small_button(egui::RichText::new(star).color(if vid.favorite { accent } else { muted }))
@@ -1276,8 +1381,15 @@ impl ScwollApp {
                             self.toast(format!("Playing: {}", vid.title));
                         }
                         if delete {
-                            self.videos.retain(|x| x.id != vid.id);
-                            self.persist();
+                            let title = vid.title.clone();
+                            self.delete_video(&vid.id);
+                            self.toast(format!("Deleted \"{title}\" ✓"));
+                        }
+                        if let Some(c) = new_cat {
+                            if c != vid.category {
+                                self.set_video_category(&vid.id, &c);
+                                self.toast(format!("Moved to \"{c}\" ✓"));
+                            }
                         }
                         if fav_toggle {
                             let now_fav = if let Some(slot) = self.videos.iter_mut().find(|x| x.id == vid.id) {
@@ -1348,7 +1460,18 @@ impl ScwollApp {
         ui.add(egui::TextEdit::singleline(&mut self.edit_title).hint_text("Title").desired_width(f32::INFINITY));
         ui.horizontal(|ui| {
             ui.label("Category:");
-            ui.add(egui::TextEdit::singleline(&mut self.edit_cat).hint_text("e.g. Music").desired_width(200.0));
+            ui.add(egui::TextEdit::singleline(&mut self.edit_cat).hint_text("e.g. Music").desired_width(160.0));
+            // Quick-pick from existing categories (fills the text field; hit Save).
+            let cats: Vec<String> = self.categories().into_iter().map(|(n, _)| n).collect();
+            egui::ComboBox::from_id_source(format!("theater-cat-{}", v.id))
+                .selected_text("Pick…")
+                .show_ui(ui, |ui| {
+                    for c in &cats {
+                        if ui.selectable_label(self.edit_cat == *c, c.clone()).clicked() {
+                            self.edit_cat = c.clone();
+                        }
+                    }
+                });
             if ui.button("Save").clicked() {
                 if let Some(slot) = self.videos.iter_mut().find(|x| x.id == v.id) {
                     if !self.edit_title.trim().is_empty() {
@@ -1367,10 +1490,10 @@ impl ScwollApp {
                 self.persist();
             }
             if ui.button("🗑 Delete").clicked() {
-                self.videos.retain(|x| x.id != v.id);
-                self.player.stop();
-                self.persist();
-                self.selected = None;
+                let title = v.title.clone();
+                let vid_id = v.id.clone();
+                self.delete_video(&vid_id);
+                self.toast(format!("Deleted \"{title}\" ✓"));
                 return;
             }
         });
@@ -1585,6 +1708,63 @@ impl ScwollApp {
         self.show_theme = open;
         // autosave on close/change? save on each change is cheap:
         save_theme(&self.theme);
+    }
+
+    fn categories_window(&mut self, ctx: &egui::Context, muted: egui::Color32) {
+        let mut open = self.show_cats;
+        let mut toast_msg: Option<String> = None;
+        let mut rename_job: Option<(String, String)> = None;
+        let mut clear_job: Option<String> = None;
+        egui::Window::new("⚙ Manage categories")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("Rename a category (moves all its videos), or clear one (moves its videos to General). Per-video moves: card ▾ menu or theater view.")
+                        .color(muted)
+                        .small(),
+                );
+                ui.separator();
+                let cats = self.categories();
+                if cats.is_empty() {
+                    ui.label("No categories yet — import something!");
+                }
+                for (name, count) in &cats {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{name} ({count})")).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("🗑 Clear").on_hover_text("Move these videos to General").clicked() {
+                                clear_job = Some(name.clone());
+                            }
+                            if ui.small_button("✎ Rename").clicked() {
+                                let buf = self.cat_edit_buf.get(name).cloned().unwrap_or_else(|| name.clone());
+                                rename_job = Some((name.clone(), buf));
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("New name:");
+                        let buf = self.cat_edit_buf.entry(name.clone()).or_insert_with(|| name.clone());
+                        ui.add(egui::TextEdit::singleline(buf).hint_text("e.g. Music").desired_width(200.0));
+                    });
+                    ui.separator();
+                }
+            });
+        self.show_cats = open;
+        if let Some((old, new)) = rename_job {
+            match self.rename_category(&old, &new) {
+                Ok(n) => toast_msg = Some(format!("Renamed \"{old}\" → \"{new}\" ({n} videos) ✓")),
+                Err(e) => toast_msg = Some(e),
+            }
+        }
+        if let Some(cat) = clear_job {
+            let n = self.clear_category(&cat);
+            toast_msg = Some(format!("Cleared \"{cat}\" — {n} videos → General ✓"));
+        }
+        if let Some(m) = toast_msg {
+            self.toast(m);
+        }
     }
 }
 
