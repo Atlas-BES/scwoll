@@ -339,6 +339,68 @@ pub fn split_url_list(text: &str) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Sources — user-saved HTML pages to browse for videos/links.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Source {
+    pub id: String,
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    pub added_at: String,
+}
+
+/// Normalize a source URL: trim, prepend https:// when the scheme is missing,
+/// reject anything that isn't http(s). Returns None for garbage input.
+pub fn normalize_source_url(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_matches(|c| {
+        c == '"' || c == '\'' || c == '<' || c == '>' || c == '(' || c == ')' || c == '[' || c == ']'
+    }).trim();
+    if t.is_empty() || t.contains(' ') {
+        return None;
+    }
+    let with_scheme = if t.contains("://") {
+        t.to_string()
+    } else if t.starts_with("www.") || t.contains('.') {
+        format!("https://{t}")
+    } else {
+        return None;
+    };
+    let u = Url::parse(&with_scheme).ok()?;
+    match u.scheme() {
+        "http" | "https" => Some(u.to_string()),
+        _ => None,
+    }
+}
+
+pub fn make_source(url: String) -> Source {
+    Source {
+        id: uuid::Uuid::new_v4().to_string(),
+        url,
+        title: String::new(),
+        added_at: now_iso(),
+    }
+}
+
+/// Short label for sidebar rows: custom title, else host + trimmed path.
+pub fn source_label(s: &Source) -> String {
+    if !s.title.trim().is_empty() {
+        return s.title.trim().to_string();
+    }
+    if let Ok(u) = Url::parse(&s.url) {
+        let host = u.host_str().unwrap_or("?").to_string();
+        let path = u.path();
+        if path.len() > 1 {
+            let short: String = path.chars().take(22).collect();
+            return format!("{host}{}", if path.len() > 22 { format!("{short}…") } else { short });
+        }
+        return host;
+    }
+    s.url.clone()
+}
+
 pub fn demo_videos() -> Vec<Video> {
     vec![
         Video {
@@ -409,5 +471,16 @@ mod tests {
     fn video_kinds() {
         assert_eq!(make_video_from_url("https://youtu.be/dQw4w9WgXcQ", "Music".into()).kind, VideoKind::Youtube);
         assert_eq!(make_video_from_url("https://example.com/clip.mp4", "M".into()).kind, VideoKind::Direct);
+    }
+
+    #[test]
+    fn source_urls() {
+        assert_eq!(normalize_source_url("https://example.com/blog"), Some("https://example.com/blog".into()));
+        assert_eq!(normalize_source_url("example.com/blog"), Some("https://example.com/blog".into()));
+        assert_eq!(normalize_source_url("www.example.com/"), Some("https://www.example.com/".into()));
+        assert!(normalize_source_url("not a url").is_none());
+        assert!(normalize_source_url("ftp://example.com/x").is_none());
+        let s = make_source("https://example.com/a".into());
+        assert_eq!(source_label(&s), "example.com/a");
     }
 }

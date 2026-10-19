@@ -63,6 +63,587 @@ fn save_theme(theme: &Theme) {
     }
 }
 
+// --------------------------------------------------------------- sources --
+// Bookmarked HTML pages the user can browse inside the app for videos and
+// links. Stored in data/sources.json (separate from library.json so old
+// libraries keep loading). Pages are fetched with ureq on worker threads;
+// links are extracted with a tiny href scanner (no extra deps).
+fn sources_path() -> PathBuf {
+    data_dir().join("sources.json")
+}
+fn load_sources() -> Vec<Source> {
+    std::fs::create_dir_all(data_dir()).ok();
+    if let Ok(s) = std::fs::read_to_string(sources_path()) {
+        if let Ok(v) = serde_json::from_str::<Vec<Source>>(&s) {
+            return v;
+        }
+    }
+    vec![]
+}
+fn save_sources(sources: &[Source]) {
+    if let Ok(s) = serde_json::to_string_pretty(sources) {
+        std::fs::write(sources_path(), s).ok();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PageLink {
+    url: String,
+    label: String,
+    is_video: bool,
+}
+
+// Lightweight rendered-document model: the fetched HTML is parsed into
+// blocks once (worker thread) and then drawn with stock egui widgets —
+// headings, paragraphs with bold/italic/code/links, lists, quotes,
+// preformatted text, rules and images. No browser engine needed.
+#[derive(Debug, Clone, Default)]
+struct DocSpan {
+    text: String,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    link: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum DocBlock {
+    Heading { level: u8, text: String },
+    Para(Vec<DocSpan>),
+    Bullet(Vec<DocSpan>),
+    Numbered(usize, Vec<DocSpan>),
+    Image { src: String, alt: String },
+    Hr,
+    Pre(String),
+    Quote(Vec<DocSpan>),
+}
+
+#[derive(Debug, Clone, Default)]
+struct HtmlDoc {
+    blocks: Vec<DocBlock>,
+}
+
+#[derive(Debug, Clone)]
+struct SourcePage {
+    title: String,
+    links: Vec<PageLink>,
+    doc: HtmlDoc,
+    fetched_at: String,
+    error: Option<String>,
+}
+
+struct SourceFetchMsg {
+    id: String,
+    result: Result<(String, Vec<PageLink>, HtmlDoc), String>,
+}
+
+struct SourceImgMsg {
+    url: String,
+    image: Option<egui::ColorImage>,
+}
+
+/// Download an HTML page (max ~2MB, 15s timeout). Errors are short strings
+/// suitable for display in the UI.
+fn fetch_html(url: &str) -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .user_agent("scwoll/0.1")
+        .build();
+    let resp = agent.get(url).call().map_err(|e| format!("request failed: {e}"))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let ctype = resp.header("Content-Type").unwrap_or("").to_lowercase();
+    if !ctype.is_empty() && !ctype.contains("html") && !ctype.contains("text") {
+        return Err(format!("not an HTML page ({ctype})"));
+    }
+    let mut buf = String::new();
+    resp.into_reader()
+        .take(2_000_000)
+        .read_to_string(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    if buf.trim().is_empty() {
+        return Err("empty page".into());
+    }
+    Ok(buf)
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_title(html: &str) -> String {
+    let lower = html.to_lowercase();
+    if let Some(start) = lower.find("<title") {
+        if let Some(gt) = html[start..].find('>') {
+            let rest = &html[start + gt + 1..];
+            let rest_lower = rest.to_lowercase();
+            if let Some(end) = rest_lower.find("</title>") {
+                return strip_tags(rest[..end].trim()).chars().take(120).collect();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Scan `<a ... href="...">label</a>` tags, resolve against the page URL,
+/// dedupe (keep first), cap at 500. Labels are tag-stripped + truncated.
+fn extract_links(base_url: &str, html: &str) -> Vec<PageLink> {
+    let base = url::Url::parse(base_url).ok();
+    let mut out: Vec<PageLink> = vec![];
+    let mut seen: HashSet<String> = HashSet::new();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() && out.len() < 500 {
+        // find next "<a" (case-insensitive)
+        let rest = &html[i..];
+        let rel = rest.to_lowercase().find("<a");
+        let tag_start = match rel {
+            Some(r) => i + r,
+            None => break,
+        };
+        // end of opening tag
+        let gt = match html[tag_start..].find('>') {
+            Some(g) => tag_start + g,
+            None => break,
+        };
+        let open_tag = &html[tag_start..=gt];
+        let open_lower = open_tag.to_lowercase();
+        // href value
+        let mut href: Option<String> = None;
+        if let Some(hpos) = open_lower.find("href") {
+            let after = &open_tag[hpos + 4..];
+            let after = after.trim_start_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '=');
+            let mut chars = after.chars();
+            if let Some(q) = chars.next() {
+                if q == '"' || q == '\'' {
+                    if let Some(end) = after[1..].find(q) {
+                        href = Some(after[1..1 + end].to_string());
+                    }
+                } else {
+                    let end = after.find(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>').unwrap_or(after.len());
+                    href = Some(after[..end].to_string());
+                }
+            }
+        }
+        // label: text until </a>
+        let after_gt = &html[gt + 1..];
+        let close_rel = after_gt.to_lowercase().find("</a>");
+        let (raw_label, next_i) = match close_rel {
+            Some(r) => (after_gt[..r.min(400)].to_string(), gt + 1 + r + 4),
+            None => (String::new(), gt + 1),
+        };
+        i = next_i.max(tag_start + 2);
+        let mut href = match href {
+            Some(h) => h.trim().to_string(),
+            None => continue,
+        };
+        if href.is_empty() || href.starts_with('#') || href.to_lowercase().starts_with("javascript:") || href.to_lowercase().starts_with("mailto:") {
+            continue;
+        }
+        // resolve relative -> absolute http(s) only
+        let abs = if let Some(b) = &base {
+            match b.join(&href) {
+                Ok(u) => u.to_string(),
+                Err(_) => continue,
+            }
+        } else {
+            href.clone()
+        };
+        let parsed = match url::Url::parse(&abs) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
+            continue;
+        }
+        let abs = parsed.to_string();
+        if !seen.insert(abs.clone()) {
+            continue;
+        }
+        let mut label = strip_tags(&raw_label);
+        if label.is_empty() {
+            label = abs.clone();
+        }
+        if label.chars().count() > 90 {
+            label = label.chars().take(89).collect::<String>() + "…";
+        }
+        let is_video = parse_youtube_id(&abs).is_some() || is_direct_video_url(&abs);
+        out.push(PageLink { url: abs, label, is_video });
+    }
+    // videos first, keep discovery order within each group
+    out.sort_by_key(|l| !l.is_video);
+    out
+}
+
+fn fetch_source_page(url: &str) -> Result<(String, Vec<PageLink>, HtmlDoc), String> {
+    let html = fetch_html(url)?;
+    let title = extract_title(&html);
+    let links = extract_links(url, &html);
+    let doc = parse_html_doc(url, &html);
+    Ok((title, links, doc))
+}
+
+// -------------------------------------------------------- html renderer --
+// Tiny HTML->document parser: block tags (h1-h6/p/div/li/img/pre/…),
+// inline bold/italic/code/links, skips script/style/comments, decodes
+// entities, resolves relative URLs. Caps output so junk pages can't blow up.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let b = s.as_bytes();
+    while i < b.len() {
+        if b[i] == b'&' {
+            if let Some(semi) = s[i..].find(';') {
+                if semi <= 10 {
+                    let ent = &s[i + 1..i + semi];
+                    let rep: Option<String> = match ent {
+                        "amp" => Some("&".into()),
+                        "lt" => Some("<".into()),
+                        "gt" => Some(">".into()),
+                        "quot" => Some("\"".into()),
+                        "apos" | "#39" => Some("'".into()),
+                        "nbsp" => Some(" ".into()),
+                        "copy" => Some("©".into()),
+                        "mdash" => Some("—".into()),
+                        "ndash" => Some("–".into()),
+                        _ if ent.starts_with('#') => {
+                            let num = &ent[1..];
+                            let cp = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                                u32::from_str_radix(hex, 16).ok()
+                            } else {
+                                num.parse::<u32>().ok()
+                            };
+                            cp.and_then(char::from_u32).map(|c| c.to_string())
+                        }
+                        _ => None,
+                    };
+                    if let Some(r) = rep {
+                        out.push_str(&r);
+                        i += semi + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // push one char (keep it simple: byte-wise for ascii, char-wise else)
+        if let Some(c) = s[i..].chars().next() {
+            out.push(c);
+            i += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let mut search = 0;
+    while let Some(pos) = lower[search..].find(name) {
+        let p = search + pos;
+        let before = p.checked_sub(1).map(|i| lower.as_bytes()[i] as char);
+        if before.is_some_and(|c| !c.is_whitespace()) {
+            search = p + name.len();
+            continue;
+        }
+        let after = tag[p + name.len()..].trim_start_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        let val = after.strip_prefix('=')?;
+        let val = val.trim_start_matches(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r');
+        if let Some(q) = val.chars().next() {
+            if q == '"' || q == '\'' {
+                return val[1..].find(q).map(|e| val[1..1 + e].to_string());
+            }
+            let end = val.find(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>').unwrap_or(val.len());
+            return Some(val[..end].to_string());
+        }
+        return None;
+    }
+    None
+}
+
+fn resolve_http(base: &url::Url, raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return None;
+    }
+    let low = t.to_lowercase();
+    if low.starts_with("javascript:") || low.starts_with("mailto:") || low.starts_with("data:") {
+        return None;
+    }
+    let abs = base.join(t).ok()?;
+    if abs.scheme() != "http" && abs.scheme() != "https" {
+        return None;
+    }
+    Some(abs.to_string())
+}
+
+fn parse_html_doc(base_url: &str, html: &str) -> HtmlDoc {
+    let base = url::Url::parse(base_url);
+    let mut doc = HtmlDoc::default();
+    let mut spans: Vec<DocSpan> = vec![];
+    let mut bold: i32 = 0;
+    let mut italic: i32 = 0;
+    let mut code: i32 = 0;
+    let mut link_stack: Vec<Option<String>> = vec![];
+    let mut skip_depth: i32 = 0; // script/style/title content
+    let mut pre_depth: i32 = 0;
+    let mut quote_depth: i32 = 0;
+    let mut heading: Option<(u8, String)> = None;
+    let mut pre_buf = String::new();
+    let mut lists: Vec<Option<usize>> = vec![]; // None = bullet, Some(n) = next number
+    let mut img_count = 0;
+
+    let push_text = |dst: &mut Vec<DocSpan>, text: String, bold: i32, italic: i32, code: i32, link: Option<String>| {
+        if text.is_empty() {
+            return;
+        }
+        let sp = DocSpan { text, bold: bold > 0, italic: italic > 0, code: code > 0, link };
+        if let Some(last) = dst.last_mut() {
+            if last.bold == sp.bold && last.italic == sp.italic && last.code == sp.code && last.link == sp.link {
+                last.text.push_str(&sp.text);
+                return;
+            }
+        }
+        if dst.len() < 80 {
+            dst.push(sp);
+        }
+    };
+
+    macro_rules! flush_para {
+        () => {{
+            if heading.is_some() || pre_depth > 0 {
+                // handled by their own closers
+            } else if spans.iter().all(|s| s.text.trim().is_empty()) {
+                spans.clear();
+            } else if !spans.is_empty() && doc.blocks.len() < 600 {
+                let cur = std::mem::take(&mut spans);
+                if quote_depth > 0 {
+                    doc.blocks.push(DocBlock::Quote(cur));
+                } else if let Some(top) = lists.last_mut() {
+                    match top {
+                        None => doc.blocks.push(DocBlock::Bullet(cur)),
+                        Some(n) => {
+                            doc.blocks.push(DocBlock::Numbered(*n, cur));
+                            *n += 1;
+                        }
+                    }
+                } else {
+                    doc.blocks.push(DocBlock::Para(cur));
+                }
+            } else {
+                spans.clear();
+            }
+        }};
+    }
+
+    let mut i = 0;
+    let n = html.len();
+    while i < n && doc.blocks.len() < 600 {
+        if html[i..].starts_with("<!--") {
+            if let Some(end) = html[i..].find("-->") {
+                i += end + 3;
+            } else {
+                break;
+            }
+            continue;
+        }
+        if html.as_bytes()[i] == b'<' {
+            if let Some(gt) = html[i..].find('>') {
+                let raw = &html[i + 1..i + gt];
+                let is_close = raw.trim_start().starts_with('/');
+                let name = raw.trim_start().trim_start_matches('/').split(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/').next().unwrap_or("").to_lowercase();
+                i += gt + 1;
+                // skip regions
+                if !is_close && (name == "script" || name == "style" || name == "title" || name == "noscript") {
+                    skip_depth += 1;
+                    continue;
+                }
+                if is_close && (name == "script" || name == "style" || name == "title" || name == "noscript") {
+                    skip_depth = skip_depth.saturating_sub(1);
+                    continue;
+                }
+                if skip_depth > 0 {
+                    continue;
+                }
+                match name.as_str() {
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                        if !is_close {
+                            flush_para!();
+                            heading = Some((name[1..2].parse().unwrap_or(2), String::new()));
+                        } else if let Some((lv, txt)) = heading.take() {
+                            let t = txt.split_whitespace().collect::<Vec<_>>().join(" ");
+                            if !t.is_empty() {
+                                doc.blocks.push(DocBlock::Heading { level: lv, text: t.chars().take(200).collect() });
+                            }
+                        }
+                    }
+                    "p" | "div" | "article" | "section" | "header" | "footer" | "main" | "table" | "tr" | "figure" | "figcaption" => {
+                        flush_para!();
+                    }
+                    "br" => flush_para!(),
+                    "hr" => {
+                        flush_para!();
+                        doc.blocks.push(DocBlock::Hr);
+                    }
+                    "ul" | "ol" => {
+                        flush_para!();
+                        if !is_close {
+                            lists.push(if name == "ol" { Some(1) } else { None });
+                            if lists.len() > 4 {
+                                lists.remove(0);
+                            }
+                        } else {
+                            lists.pop();
+                        }
+                    }
+                    "li" => flush_para!(),
+                    "blockquote" => {
+                        flush_para!();
+                        if !is_close {
+                            quote_depth += 1;
+                        } else {
+                            quote_depth = quote_depth.saturating_sub(1);
+                        }
+                    }
+                    "pre" => {
+                        if !is_close {
+                            flush_para!();
+                            pre_depth += 1;
+                            pre_buf.clear();
+                        } else {
+                            pre_depth = pre_depth.saturating_sub(1);
+                            if !pre_buf.trim().is_empty() && doc.blocks.len() < 600 {
+                                let t: String = pre_buf.chars().take(2000).collect();
+                                doc.blocks.push(DocBlock::Pre(t));
+                            }
+                            pre_buf.clear();
+                        }
+                    }
+                    "a" => {
+                        if !is_close {
+                            let href = tag_attr(raw, "href").unwrap_or_default();
+                            let abs = base.as_ref().ok().and_then(|b| resolve_http(b, &href));
+                            link_stack.push(abs);
+                        } else {
+                            link_stack.pop();
+                        }
+                    }
+                    "b" | "strong" => {
+                        if !is_close {
+                            bold += 1;
+                        } else {
+                            bold = bold.saturating_sub(1);
+                        }
+                    }
+                    "i" | "em" | "cite" => {
+                        if !is_close {
+                            italic += 1;
+                        } else {
+                            italic = italic.saturating_sub(1);
+                        }
+                    }
+                    "code" | "tt" | "kbd" => {
+                        if !is_close {
+                            code += 1;
+                        } else {
+                            code = code.saturating_sub(1);
+                        }
+                    }
+                    "img" => {
+                        if img_count < 60 {
+                            if let Some(src_raw) = tag_attr(raw, "src") {
+                                if let Some(abs) = base.as_ref().ok().and_then(|b| resolve_http(b, &src_raw)) {
+                                    flush_para!();
+                                    let alt = tag_attr(raw, "alt").unwrap_or_default().chars().take(120).collect();
+                                    doc.blocks.push(DocBlock::Image { src: abs, alt });
+                                    img_count += 1;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            } else {
+                break;
+            }
+        }
+        // text until next '<'
+        let next = html[i..].find('<').map(|p| i + p).unwrap_or(n);
+        let chunk = &html[i..next];
+        i = next;
+        if skip_depth > 0 {
+            continue;
+        }
+        let decoded = decode_entities(chunk);
+        if pre_depth > 0 {
+            if pre_buf.len() < 3000 {
+                pre_buf.push_str(&decoded);
+            }
+            continue;
+        }
+        if let Some((_, ref mut htxt)) = heading {
+            htxt.push_str(&decoded);
+            if htxt.len() > 400 {
+                htxt.truncate(400);
+            }
+            continue;
+        }
+        // collapse whitespace (keep single spaces)
+        let collapsed = decoded.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        let link = link_stack.iter().rev().flatten().next().cloned();
+        let piece = if spans.is_empty() { collapsed } else { format!(" {collapsed}") };
+        push_text(&mut spans, piece, bold, italic, code, link);
+        // auto-flush giant paragraphs
+        if spans.iter().map(|s| s.text.len()).sum::<usize>() > 1200 {
+            flush_para!();
+        }
+    }
+    flush_para!();
+    if let Some((lv, txt)) = heading.take() {
+        let t = txt.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !t.is_empty() {
+            doc.blocks.push(DocBlock::Heading { level: lv, text: t.chars().take(200).collect() });
+        }
+    }
+    doc
+}
+
+/// Download + decode a page image into an egui image (worker thread).
+fn fetch_page_image(url: &str) -> Option<egui::ColorImage> {
+    let bytes = download_bytes(url)?;
+    if bytes.is_empty() || bytes.len() > 4_000_000 {
+        return None;
+    }
+    let img = image::load_from_memory(&bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let rgba = if (w as u64) * (h as u64) > 900 * 700 {
+        img.resize(900, 700, image::imageops::FilterType::Triangle).to_rgba8()
+    } else {
+        rgba
+    };
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw()))
+}
+
 // ---------------------------------------------------------------- colors --
 fn hex_to_color(hex: &str) -> egui::Color32 {
     let h = hex.trim().trim_start_matches('#');
@@ -670,6 +1251,20 @@ struct ScwollApp {
     edit_cat: String,
     show_cats: bool,
     cat_edit_buf: HashMap<String, String>,
+    // sources: bookmarked HTML pages browsed in-app
+    sources: Vec<Source>,
+    showing_sources: bool,
+    active_source_id: Option<String>,
+    source_input: String,
+    source_url_bar: String,
+    source_cache: HashMap<String, SourcePage>,
+    source_loading: HashSet<String>,
+    source_rx: Receiver<SourceFetchMsg>,
+    source_tx: Sender<SourceFetchMsg>,
+    source_img_rx: Receiver<SourceImgMsg>,
+    source_img_tx: Sender<SourceImgMsg>,
+    source_img_cache: HashMap<String, egui::TextureHandle>,
+    source_img_pending: HashSet<String>,
     player: Player,
     toast: Option<(String, Instant)>,
     // thumbnails: `thumb_job_tx` is the FIFO queue, drained by a pool of
@@ -710,6 +1305,8 @@ impl ScwollApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
         let (job_tx, job_rx) = channel::<Video>();
+        let (source_tx, source_rx) = channel::<SourceFetchMsg>();
+        let (source_img_tx, source_img_rx) = channel::<SourceImgMsg>();
         // Worker pool sharing one queue: N videos at a time, N from free
         // RAM. The mutex is only held for the recv itself, never while a
         // thumbnail is being built.
@@ -757,6 +1354,19 @@ impl ScwollApp {
             edit_cat: String::new(),
             show_cats: false,
             cat_edit_buf: HashMap::new(),
+            sources: load_sources(),
+            showing_sources: false,
+            active_source_id: None,
+            source_input: String::new(),
+            source_url_bar: String::new(),
+            source_cache: HashMap::new(),
+            source_loading: HashSet::new(),
+            source_rx: source_rx,
+            source_tx: source_tx,
+            source_img_rx: source_img_rx,
+            source_img_tx: source_img_tx,
+            source_img_cache: HashMap::new(),
+            source_img_pending: HashSet::new(),
             player: Player::new(),
             toast: None,
             thumb_rx: rx,
@@ -854,6 +1464,147 @@ impl ScwollApp {
         self.cat_edit_buf.remove(cat);
         self.persist();
         n
+    }
+
+    // ---------------- sources ----------------
+    fn persist_sources(&self) {
+        save_sources(&self.sources);
+    }
+    fn active_source(&self) -> Option<Source> {
+        self.active_source_id
+            .as_deref()
+            .and_then(|id| self.sources.iter().find(|s| s.id == id).cloned())
+    }
+    /// Add one pasted line: it may hold a single URL or a whole list
+    /// (lines/spaces/commas, like the bulk importer). Returns (added, skipped).
+    fn add_sources_bulk(&mut self, raw: &str) -> (usize, usize) {
+        let mut cands = split_url_list(raw);
+        if cands.is_empty() {
+            if let Some(u) = normalize_source_url(raw) {
+                cands.push(u);
+            }
+        }
+        let mut added = 0;
+        let mut skipped = 0;
+        for c in cands {
+            let norm = match normalize_source_url(&c) {
+                Some(u) => u,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if self.sources.iter().any(|s| s.url == norm) {
+                skipped += 1;
+                continue;
+            }
+            self.sources.push(make_source(norm));
+            added += 1;
+        }
+        if added > 0 {
+            // newest first
+            self.sources.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+            self.persist_sources();
+        }
+        (added, skipped)
+    }
+    fn remove_source(&mut self, id: &str) {
+        self.sources.retain(|s| s.id != id);
+        self.source_cache.remove(id);
+        self.source_loading.remove(id);
+        if self.active_source_id.as_deref() == Some(id) {
+            self.active_source_id = None;
+            self.source_url_bar.clear();
+            self.showing_sources = true;
+        }
+        self.persist_sources();
+    }
+    /// Single entry point for the Sources page.
+    fn open_sources_page(&mut self) {
+        self.showing_sources = true;
+        self.active_source_id = None;
+        self.selected = None;
+    }
+    /// Open a URL in the Sources view: selects the saved entry when known,
+    /// otherwise saves it first so Back/refresh keep working.
+    fn open_source_url(&mut self, raw: &str) -> Result<(), String> {
+        let norm = normalize_source_url(raw).ok_or("That doesn't look like an http(s) URL.")?;
+        if let Some(s) = self.sources.iter().find(|s| s.url == norm).cloned() {
+            self.active_source_id = Some(s.id.clone());
+            self.showing_sources = false;
+            self.selected = None;
+            self.source_url_bar = s.url.clone();
+            self.request_source(&s.id, &s.url);
+        } else {
+            let s = make_source(norm.clone());
+            let id = s.id.clone();
+            self.sources.push(s);
+            self.sources.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+            self.persist_sources();
+            self.active_source_id = Some(id.clone());
+            self.showing_sources = false;
+            self.selected = None;
+            self.source_url_bar = norm.clone();
+            self.request_source(&id, &norm);
+        }
+        Ok(())
+    }
+    fn request_source(&mut self, id: &str, url: &str) {
+        if self.source_cache.contains_key(id) || self.source_loading.contains(id) {
+            return;
+        }
+        self.source_loading.insert(id.to_string());
+        let tx = self.source_tx.clone();
+        let id = id.to_string();
+        let url = url.to_string();
+        std::thread::spawn(move || {
+            let result = fetch_source_page(&url);
+            tx.send(SourceFetchMsg { id, result }).ok();
+        });
+    }
+    fn pump_sources(&mut self) {
+        while let Ok(msg) = self.source_rx.try_recv() {
+            self.source_loading.remove(&msg.id);
+            let page = match msg.result {
+                Ok((title, links, doc)) => {
+                    // remember the page title as the source label
+                    if !title.is_empty() {
+                        if let Some(s) = self.sources.iter_mut().find(|s| s.id == msg.id) {
+                            s.title = title.clone();
+                        }
+                        self.persist_sources();
+                    }
+                    SourcePage { title, links, doc, fetched_at: now_iso(), error: None }
+                }
+                Err(e) => SourcePage { title: String::new(), links: vec![], doc: HtmlDoc::default(), fetched_at: now_iso(), error: Some(e) },
+            };
+            self.source_cache.insert(msg.id, page);
+        }
+    }
+    fn request_source_image(&mut self, url: &str) {
+        if self.source_img_cache.contains_key(url) || self.source_img_pending.contains(url) {
+            return;
+        }
+        // cap in-flight image jobs so a photo-heavy page can't fork-bomb
+        if self.source_img_pending.len() >= 8 {
+            return;
+        }
+        self.source_img_pending.insert(url.to_string());
+        let tx = self.source_img_tx.clone();
+        let url = url.to_string();
+        std::thread::spawn(move || {
+            let image = fetch_page_image(&url);
+            tx.send(SourceImgMsg { url, image }).ok();
+        });
+    }
+    fn pump_source_images(&mut self, ctx: &egui::Context) {
+        while let Ok(msg) = self.source_img_rx.try_recv() {
+            self.source_img_pending.remove(&msg.url);
+            if let Some(image) = msg.image {
+                let tex = ctx.load_texture(format!("srcimg-{}", msg.url), image, egui::TextureOptions::LINEAR);
+                self.source_img_cache.insert(msg.url, tex);
+            }
+        }
     }
 
     fn filtered(&self) -> Vec<&Video> {
@@ -1027,6 +1778,8 @@ impl eframe::App for ScwollApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_visuals(ctx, &self.theme);
         self.pump_thumbs(ctx);
+        self.pump_sources();
+        self.pump_source_images(ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
 
         let glass = true; // liquid glass is the only theme
@@ -1076,10 +1829,16 @@ impl eframe::App for ScwollApp {
                         SourceFilter::Local => format!("🗂 {}", s.label()),
                         SourceFilter::Direct => format!("🔗 {}", s.label()),
                     };
-                    if ui.selectable_label(self.source == s, label).clicked() {
+                    if ui.selectable_label(self.source == s && !self.showing_sources && self.active_source_id.is_none(), label).clicked() {
                         self.source = s;
                         self.selected = None;
+                        self.active_source_id = None;
+                        self.showing_sources = false;
                     }
+                }
+                // Single entry point to the Sources page.
+                if ui.selectable_label(self.showing_sources || self.active_source_id.is_some(), format!("🌐 Sources ({})", self.sources.len())).on_hover_text("Saved web pages — rendered in-app").clicked() {
+                    self.open_sources_page();
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1091,16 +1850,22 @@ impl eframe::App for ScwollApp {
                     });
                 });
                 let cats = self.categories();
-                if ui.selectable_label(self.active_category == "All", format!("All ({})", self.videos.len())).clicked() {
+                if ui.selectable_label(self.active_category == "All" && !self.showing_sources && self.active_source_id.is_none(), format!("All ({})", self.videos.len())).clicked() {
                         self.active_category = "All".into();
+                        self.active_source_id = None;
+                        self.showing_sources = false;
                     }
                     let fav_n = self.videos.iter().filter(|x| x.favorite).count();
-                    if ui.selectable_label(self.active_category == "Favorites", format!("★ Favorites ({fav_n})")).clicked() {
+                    if ui.selectable_label(self.active_category == "Favorites" && !self.showing_sources && self.active_source_id.is_none(), format!("★ Favorites ({fav_n})")).clicked() {
                         self.active_category = "Favorites".into();
+                        self.active_source_id = None;
+                        self.showing_sources = false;
                     }
                     for (name, count) in &cats {
-                        if ui.selectable_label(self.active_category == *name, format!("{name} ({count})")).clicked() {
+                        if ui.selectable_label(self.active_category == *name && !self.showing_sources && self.active_source_id.is_none(), format!("{name} ({count})")).clicked() {
                             self.active_category = name.clone();
+                            self.active_source_id = None;
+                            self.showing_sources = false;
                         }
                     }
                     if cats.is_empty() {
@@ -1119,7 +1884,17 @@ impl eframe::App for ScwollApp {
 
         // ---------------- main ----------------
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(id) = self.selected.clone() {
+            // stale source selection (deleted elsewhere)? drop it.
+            if let Some(id) = self.active_source_id.clone() {
+                if !self.sources.iter().any(|s| s.id == id) {
+                    self.active_source_id = None;
+                }
+            }
+            if self.showing_sources {
+                self.show_sources_list(ui, accent, muted);
+            } else if self.active_source_id.is_some() {
+                self.show_source_doc(ui, ctx, accent, muted);
+            } else if let Some(id) = self.selected.clone() {
                 self.show_theater(ui, &id, accent, muted);
             } else {
                 self.show_grid(ui, accent, muted);
@@ -1403,6 +2178,356 @@ impl ScwollApp {
                         }
                     }
                     });
+            }
+        });
+    }
+
+    /// Sources home page: every saved source in one place. Add URLs
+    /// (single or bulk list), open one to render it in-app.
+    fn show_sources_list(&mut self, ui: &mut egui::Ui, accent: egui::Color32, muted: egui::Color32) {
+        if ui.button("← Back to library").clicked() {
+            self.showing_sources = false;
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.heading("🌐 Sources");
+            ui.label(egui::RichText::new(format!("{} saved", self.sources.len())).color(muted));
+        });
+        ui.label(egui::RichText::new("Save article / index / channel pages here, then open one to read it rendered inside the app. Links stay in-app; videos get ▶ Play / ＋ Import.").color(muted).small());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.source_input)
+                    .hint_text("Paste page URL(s) — lines, spaces or commas all work…")
+                    .desired_width(f32::INFINITY),
+            );
+            let commit = ui.button("＋ Add").clicked()
+                || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if commit {
+                let raw = self.source_input.clone();
+                if raw.trim().is_empty() {
+                    self.toast("Paste a page URL first.");
+                } else {
+                    let (a, sk) = self.add_sources_bulk(&raw);
+                    if a > 0 {
+                        self.toast(if sk > 0 { format!("Added {a} source(s), skipped {sk} ✓") } else { format!("Added {a} source(s) ✓") });
+                        self.source_input.clear();
+                    } else {
+                        self.toast("Nothing new (bad URL or already added).");
+                    }
+                }
+            }
+        });
+        ui.separator();
+        let rows: Vec<Source> = self.sources.clone();
+        if rows.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(30.0);
+                ui.heading("🌐 No sources yet");
+                ui.label("Paste any article, blog, docs or index page above — it will render inside the app.");
+            });
+            return;
+        }
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for s in &rows {
+                egui::Frame::group(ui.style()).rounding(egui::Rounding::same(10.0)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width().max(200.0));
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(source_label(s)).strong());
+                            ui.label(egui::RichText::new(s.url.clone()).color(muted).small());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("🗑").on_hover_text("Remove source").clicked() {
+                                self.remove_source(&s.id);
+                                self.toast("Source removed ✓");
+                            }
+                            if ui.button("↗").on_hover_text("Open in system browser").clicked() {
+                                open::that(&s.url).ok();
+                            }
+                            if ui.add(egui::Button::new(egui::RichText::new("Open ➜").color(egui::Color32::WHITE)).fill(accent)).on_hover_text("Render this page inside the app").clicked() {
+                                self.showing_sources = false;
+                                self.active_source_id = Some(s.id.clone());
+                                self.selected = None;
+                                self.source_url_bar = s.url.clone();
+                                self.request_source(&s.id, &s.url);
+                            }
+                        });
+                    });
+                });
+            }
+        });
+    }
+
+    /// Render one saved source as a document page inside the app.
+    fn show_source_doc(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, accent: egui::Color32, muted: egui::Color32) {
+        let Some(src) = self.active_source() else {
+            self.active_source_id = None;
+            self.showing_sources = true;
+            return;
+        };
+        let sid = src.id.clone();
+        let surl = src.url.clone();
+        if self.source_url_bar.is_empty() {
+            self.source_url_bar = surl.clone();
+        }
+        ui.horizontal(|ui| {
+            if ui.button("← Sources").clicked() {
+                self.active_source_id = None;
+                self.showing_sources = true;
+                return;
+            }
+            if ui.button("← Library").clicked() {
+                self.active_source_id = None;
+                self.showing_sources = false;
+                return;
+            }
+        });
+        ui.add_space(2.0);
+        ui.heading(egui::RichText::new(source_label(&src)).strong());
+        ui.label(egui::RichText::new(surl.clone()).color(muted).small());
+        // address bar: any URL renders in-app (auto-saved)
+        let mut go_now = false;
+        ui.horizontal(|ui| {
+            ui.label("URL:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.source_url_bar)
+                    .hint_text("https://…")
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                go_now = true;
+            }
+            if ui.button("Go ➜").clicked() {
+                go_now = true;
+            }
+        });
+        if go_now {
+            let raw = self.source_url_bar.clone();
+            if let Err(e) = self.open_source_url(&raw) {
+                self.toast(e);
+            }
+            return;
+        }
+        ui.horizontal(|ui| {
+            if ui.button("↻ Refresh").clicked() {
+                self.source_cache.remove(&sid);
+                self.source_loading.remove(&sid);
+                self.request_source(&sid, &surl);
+            }
+            if ui.button("↗ Browser").clicked() {
+                open::that(&surl).ok();
+            }
+            if ui.button("⧉ Copy").clicked() {
+                ctx.output_mut(|o| o.copied_text = surl.clone());
+                self.toast("URL copied ✓");
+            }
+            if ui.button("🗑 Remove").clicked() {
+                self.remove_source(&sid);
+                self.toast("Source removed ✓");
+                return;
+            }
+        });
+        ui.separator();
+        self.request_source(&sid, &surl);
+        if self.source_loading.contains(&sid) && !self.source_cache.contains_key(&sid) {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading page…");
+            });
+            return;
+        }
+        let Some(page) = self.source_cache.get(&sid).cloned() else {
+            ui.label("Nothing loaded yet — hit Refresh.");
+            return;
+        };
+        if let Some(err) = page.error {
+            ui.label(egui::RichText::new(format!("⚠ Couldn't load page: {err}")).color(egui::Color32::from_rgb(220, 120, 120)));
+            ui.horizontal(|ui| {
+                if ui.button("↻ Retry").clicked() {
+                    self.source_cache.remove(&sid);
+                    self.request_source(&sid, &surl);
+                }
+                if ui.button("↗ Open in browser instead").clicked() {
+                    open::that(&surl).ok();
+                }
+            });
+            return;
+        }
+        // video strip: every video found on the page, playable/importable
+        let vids: Vec<PageLink> = page.links.iter().filter(|l| l.is_video).cloned().collect();
+        if !vids.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("🎬 {} video(s) on this page", vids.len())).color(accent).strong());
+                if ui.small_button("＋ Import all").clicked() {
+                    let cat = if self.active_category != "All" && self.active_category != "Favorites" {
+                        self.active_category.clone()
+                    } else {
+                        "General".into()
+                    };
+                    let mut added = 0;
+                    let mut skipped = 0;
+                    for l in &vids {
+                        if self.videos.iter().any(|x| x.url == l.url) {
+                            skipped += 1;
+                            continue;
+                        }
+                        self.videos.push(make_video_from_url(&l.url, cat.clone()));
+                        added += 1;
+                    }
+                    self.persist();
+                    self.toast(format!("Imported {added}, skipped {skipped}."));
+                }
+            });
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for l in &vids {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(220.0);
+                            ui.label(egui::RichText::new(l.label.clone()).strong());
+                            ui.horizontal(|ui| {
+                                if self.videos.iter().any(|x| x.url == l.url) {
+                                    ui.label(egui::RichText::new("in library ✓").color(muted).small());
+                                } else if ui.small_button("＋ Import").clicked() {
+                                    let cat = if self.active_category != "All" && self.active_category != "Favorites" {
+                                        self.active_category.clone()
+                                    } else {
+                                        "General".into()
+                                    };
+                                    match self.import_url(&l.url, &cat, &l.label) {
+                                        Ok(()) => self.toast("Added ✓"),
+                                        Err(e) => self.toast(e),
+                                    }
+                                }
+                                if ui.small_button("▶ Play").clicked() {
+                                    let v = make_video_from_url(&l.url, "General".into());
+                                    self.player.play(&v);
+                                    self.toast(format!("Playing: {}", l.label));
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+            ui.separator();
+        }
+        if !page.title.is_empty() {
+            ui.heading(page.title.clone());
+        }
+        ui.label(egui::RichText::new(format!("fetched {} · {} blocks", page.fetched_at, page.doc.blocks.len())).color(muted).small());
+        ui.separator();
+        // the rendered page itself
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let blocks = page.doc.blocks.clone();
+            if blocks.is_empty() {
+                ui.label(egui::RichText::new("This page has no readable text (it may be script-rendered). Try the browser button.").color(muted));
+                return;
+            }
+            let mut nav_to: Option<String> = None;
+            for b in blocks.iter().take(600) {
+                match b {
+                    DocBlock::Heading { level, text } => {
+                        let size = match level {
+                            1 => 24.0,
+                            2 => 20.0,
+                            3 => 17.0,
+                            _ => 15.0,
+                        };
+                        ui.label(egui::RichText::new(text).size(size).strong());
+                        ui.add_space(2.0);
+                    }
+                    DocBlock::Para(spans) | DocBlock::Quote(spans) => {
+                        if matches!(b, DocBlock::Quote(_)) {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("▌").color(accent));
+                                ui.vertical(|ui| {
+                                    self.render_spans(ui, spans, accent, &mut nav_to);
+                                });
+                            });
+                        } else {
+                            self.render_spans(ui, spans, accent, &mut nav_to);
+                        }
+                        ui.add_space(4.0);
+                    }
+                    DocBlock::Bullet(spans) => {
+                        ui.horizontal(|ui| {
+                            ui.label("•");
+                            ui.vertical(|ui| {
+                                self.render_spans(ui, spans, accent, &mut nav_to);
+                            });
+                        });
+                    }
+                    DocBlock::Numbered(n, spans) => {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{n}."));
+                            ui.vertical(|ui| {
+                                self.render_spans(ui, spans, accent, &mut nav_to);
+                            });
+                        });
+                    }
+                    DocBlock::Image { src, alt } => {
+                        self.request_source_image(src);
+                        if let Some(tex) = self.source_img_cache.get(src) {
+                            let size = tex.size();
+                            let max_w = ui.available_width().min(640.0).max(80.0);
+                            let scale = (max_w / size[0] as f32).min(1.0);
+                            ui.add(egui::Image::from_texture(tex).fit_to_exact_size(egui::vec2(size[0] as f32 * scale, size[1] as f32 * scale)));
+                            if !alt.is_empty() {
+                                ui.label(egui::RichText::new(alt.clone()).color(muted).small().italics());
+                            }
+                        } else {
+                            ui.label(egui::RichText::new(format!("🖼 {}", if alt.is_empty() { "loading image…" } else { alt })).color(muted).small());
+                        }
+                        ui.add_space(4.0);
+                    }
+                    DocBlock::Hr => {
+                        ui.separator();
+                    }
+                    DocBlock::Pre(t) => {
+                        ui.label(egui::RichText::new(t.clone()).monospace().small());
+                        ui.add_space(4.0);
+                    }
+                }
+            }
+            if let Some(url) = nav_to {
+                let _ = self.open_source_url(&url);
+            }
+        });
+    }
+
+    /// Inline rich-text row: bold/italic/code + clickable links (stay in-app).
+    fn render_spans(&mut self, ui: &mut egui::Ui, spans: &[DocSpan], accent: egui::Color32, nav_to: &mut Option<String>) {
+        ui.horizontal_wrapped(|ui| {
+            for sp in spans {
+                let mut rt = egui::RichText::new(sp.text.clone());
+                if sp.bold {
+                    rt = rt.strong();
+                }
+                if sp.italic {
+                    rt = rt.italics();
+                }
+                if sp.code {
+                    rt = rt.monospace();
+                }
+                if let Some(link) = &sp.link {
+                    let is_vid = parse_youtube_id(link).is_some() || is_direct_video_url(link);
+                    let label = if is_vid { format!("▶ {}", sp.text) } else { sp.text.clone() };
+                    let resp = ui.link(egui::RichText::new(label).color(accent).underline());
+                    if resp.clicked() {
+                        if is_vid {
+                            let v = make_video_from_url(link, "General".into());
+                            self.player.play(&v);
+                            self.toast(format!("Playing: {}", sp.text));
+                        } else {
+                            *nav_to = Some(link.clone());
+                        }
+                    }
+                    resp.on_hover_text(link.clone());
+                } else if sp.code {
+                    ui.label(rt);
+                } else {
+                    ui.label(rt);
+                }
             }
         });
     }
