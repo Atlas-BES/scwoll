@@ -783,7 +783,11 @@ impl ScwollApp {
             .videos
             .iter()
             .filter(|v| {
-                if self.active_category != "All" && v.category != self.active_category {
+                if self.active_category == "Favorites" {
+                    if !v.favorite {
+                        return false;
+                    }
+                } else if self.active_category != "All" && v.category != self.active_category {
                     return false;
                 }
                 if !self.source.matches(&v.kind) {
@@ -823,8 +827,22 @@ impl ScwollApp {
         }
     }
 
+    /// Retry a failed thumbnail: clear the failure cooldown marker so the
+    /// worker really re-runs ffmpeg/mpv instead of skipping, then re-queue.
+    fn retry_thumb(&mut self, v: &Video) {
+        std::fs::remove_file(thumb_failed_file(&v.id)).ok();
+        self.thumb_pending.remove(&v.id);
+        self.request_thumb(v);
+        self.toast("Retrying thumbnail…");
+    }
+
     fn request_thumb(&mut self, v: &Video) {
         if self.thumb_cache.contains_key(&v.id) || self.thumb_pending.contains(&v.id) {
+            return;
+        }
+        // Failed inside the cooldown window: don't re-queue (and spin the
+        // workers) every frame — the tile keeps its retry button instead.
+        if thumb_failed_recently(&v.id) {
             return;
         }
         // Queue instead of spawning per-video: the worker pool above
@@ -990,6 +1008,10 @@ impl eframe::App for ScwollApp {
                 if ui.selectable_label(self.active_category == "All", format!("All ({})", self.videos.len())).clicked() {
                         self.active_category = "All".into();
                     }
+                    let fav_n = self.videos.iter().filter(|x| x.favorite).count();
+                    if ui.selectable_label(self.active_category == "Favorites", format!("★ Favorites ({fav_n})")).clicked() {
+                        self.active_category = "Favorites".into();
+                    }
                     for (name, count) in &cats {
                         if ui.selectable_label(self.active_category == *name, format!("{name} ({count})")).clicked() {
                             self.active_category = name.clone();
@@ -1054,10 +1076,15 @@ impl ScwollApp {
         if list.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.heading("📼 Nothing here yet");
-                ui.label("Import a URL, a .txt list, or a folder of videos.");
-                if ui.button("＋ Import videos").clicked() {
-                    self.show_import = true;
+                if self.active_category == "Favorites" {
+                    ui.heading("☆ No favorites yet");
+                    ui.label("Tap ☆ on any video to pin it here.");
+                } else {
+                    ui.heading("📼 Nothing here yet");
+                    ui.label("Import a URL, a .txt list, or a folder of videos.");
+                    if ui.button("＋ Import videos").clicked() {
+                        self.show_import = true;
+                    }
                 }
             });
             return;
@@ -1092,6 +1119,7 @@ impl ScwollApp {
                         let mut opened = false;
                         let mut play = false;
                         let mut delete = false;
+                        let mut fav_toggle = false;
                         // ============ video box ============
                         // stock widgets only: no custom painting, nothing can overlap.
                         // top row (source left, category right) / thumbnail /
@@ -1117,7 +1145,8 @@ impl ScwollApp {
                                     VideoKind::Local => "\u{1F5C2} Local",
                                     VideoKind::Direct => "\u{1F517} Link",
                                 };
-                                // top row of the box: source + category adjacent, no gap
+                                // top row of the box: source + category left,
+                                // favorite star right.
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     ui.label(egui::RichText::new(src).color(muted).small());
@@ -1128,6 +1157,15 @@ impl ScwollApp {
                                             .small()
                                             .strong(),
                                     );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let star = if vid.favorite { "★" } else { "☆" };
+                                        if ui.small_button(egui::RichText::new(star).color(if vid.favorite { accent } else { muted }))
+                                            .on_hover_text(if vid.favorite { "Remove from Favorites" } else { "Add to Favorites" })
+                                            .clicked()
+                                        {
+                                            fav_toggle = true;
+                                        }
+                                    });
                                 });
                                 ui.add_space(2.0);
                                 // thumbnail (click to open); aspect-fit into the
@@ -1159,7 +1197,7 @@ impl ScwollApp {
                                         .unwrap_or('\u{25b6}')
                                         .to_uppercase()
                                         .to_string();
-                                    ui.add_sized(
+                                    let tile = ui.add_sized(
                                         egui::vec2(content_w, slot_h),
                                         egui::Button::new(
                                             egui::RichText::new(letter)
@@ -1167,8 +1205,22 @@ impl ScwollApp {
                                                 .color(egui::Color32::WHITE),
                                         )
                                         .fill(placeholder_color(&vid.id)),
-                                    )
-                                    .clicked()
+                                    );
+                                    // Failed picture (.failed marker on disk):
+                                    // overlay a retry button in the middle.
+                                    if thumb_failed_file(&vid.id).exists() {
+                                        let retry = ui.put(
+                                            egui::Rect::from_center_size(
+                                                tile.rect.center(),
+                                                egui::vec2(76.0, 26.0),
+                                            ),
+                                            egui::Button::new("↻ Retry"),
+                                        );
+                                        if retry.clicked() {
+                                            self.retry_thumb(&vid);
+                                        }
+                                    }
+                                    tile.clicked()
                                 };
                                 if thumb_clicked {
                                     opened = true;
@@ -1226,6 +1278,16 @@ impl ScwollApp {
                         if delete {
                             self.videos.retain(|x| x.id != vid.id);
                             self.persist();
+                        }
+                        if fav_toggle {
+                            let now_fav = if let Some(slot) = self.videos.iter_mut().find(|x| x.id == vid.id) {
+                                slot.favorite = !slot.favorite;
+                                slot.favorite
+                            } else {
+                                false
+                            };
+                            self.persist();
+                            self.toast(if now_fav { "★ Added to Favorites" } else { "☆ Removed from Favorites" });
                         }
                     }
                     });
@@ -1297,6 +1359,12 @@ impl ScwollApp {
                 }
                 self.persist();
                 self.toast("Saved ✓");
+            }
+            if ui.button(if v.favorite { "★ Favorited" } else { "☆ Favorite" }).clicked() {
+                if let Some(slot) = self.videos.iter_mut().find(|x| x.id == v.id) {
+                    slot.favorite = !slot.favorite;
+                }
+                self.persist();
             }
             if ui.button("🗑 Delete").clicked() {
                 self.videos.retain(|x| x.id != v.id);

@@ -28,6 +28,8 @@ pub struct Video {
     pub category: String,
     pub added_at: String,
     pub thumbnail: String,
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 fn default_category() -> String {
@@ -265,6 +267,7 @@ pub fn make_video_from_url(raw_url: &str, category: String) -> Video {
             category,
             added_at: now_iso(),
             thumbnail: format!("https://i.ytimg.com/vi/{yid}/hqdefault.jpg"),
+            favorite: false,
         };
     }
     if is_direct_video_url(&raw_url) {
@@ -278,6 +281,7 @@ pub fn make_video_from_url(raw_url: &str, category: String) -> Video {
             category,
             added_at: now_iso(),
             thumbnail: String::new(),
+            favorite: false,
         };
     }
     // generic page URL — still importable, opens externally / iframe attempt
@@ -291,6 +295,7 @@ pub fn make_video_from_url(raw_url: &str, category: String) -> Video {
         category,
         added_at: now_iso(),
         thumbnail: String::new(),
+        favorite: false,
     }
 }
 
@@ -310,6 +315,7 @@ pub fn make_video_from_file(path: &std::path::Path, category: String) -> Video {
         category: normalize_category(Some(category)),
         added_at: now_iso(),
         thumbnail: String::new(),
+        favorite: false,
     }
 }
 
@@ -345,6 +351,7 @@ pub fn demo_videos() -> Vec<Video> {
             category: "Film".into(),
             added_at: now_iso(),
             thumbnail: "https://i.ytimg.com/vi/aqz-KE-bpKQ/hqdefault.jpg".into(),
+            favorite: false,
         },
         Video {
             id: uuid::Uuid::new_v4().to_string(),
@@ -356,6 +363,7 @@ pub fn demo_videos() -> Vec<Video> {
             category: "Music".into(),
             added_at: now_iso(),
             thumbnail: "https://i.ytimg.com/vi/jfKfPfyJRdk/hqdefault.jpg".into(),
+            favorite: false,
         },
         Video {
             id: uuid::Uuid::new_v4().to_string(),
@@ -367,6 +375,7 @@ pub fn demo_videos() -> Vec<Video> {
             category: "Tech".into(),
             added_at: now_iso(),
             thumbnail: String::new(),
+            favorite: false,
         },
     ]
 }
