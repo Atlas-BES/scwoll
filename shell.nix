@@ -25,6 +25,9 @@ pkgs.mkShell {
     libx11 libxcursor libxrandr libxi
     fontconfig freetype
     gtk3 glib dbus
+    chromium # headless JS rendering for Sources pages (--dump-dom snapshots)
+    file # required by appimagetool when building the AppImage
+    desktop-file-utils # desktop-file-validate for make-appimage.sh (optional)
   ];
 
   # winit/glutin dlopen these at RUNTIME, so they must be on LD_LIBRARY_PATH.

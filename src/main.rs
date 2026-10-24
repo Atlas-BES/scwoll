@@ -48,11 +48,14 @@ fn load_theme() -> Theme {
         .ok()
         .and_then(|s| serde_json::from_str::<Theme>(&s).ok())
         .unwrap_or_default();
-    // Liquid glass is the only theme: pin it and migrate old saves
-    // (old default red accent -> cerulean).
+    // Keep the save-file style tag pinned for compatibility and migrate old
+    // defaults (old default red accent -> cerulean).
     theme.style = "glass".into();
     if theme.accent.eq_ignore_ascii_case("#ff0033") {
         theme.accent = Theme::default().accent;
+    }
+    if theme.accent2.trim().is_empty() {
+        theme.accent2 = Theme::default().accent2;
     }
     save_theme(&theme);
     theme
@@ -130,11 +133,13 @@ struct SourcePage {
     doc: HtmlDoc,
     fetched_at: String,
     error: Option<String>,
+    /// true when the shown doc came from a post-JS DOM snapshot.
+    js_rendered: bool,
 }
 
 struct SourceFetchMsg {
     id: String,
-    result: Result<(String, Vec<PageLink>, HtmlDoc), String>,
+    result: Result<(String, Vec<PageLink>, HtmlDoc, bool), String>,
 }
 
 struct SourceImgMsg {
@@ -286,12 +291,147 @@ fn extract_links(base_url: &str, html: &str) -> Vec<PageLink> {
     out
 }
 
-fn fetch_source_page(url: &str) -> Result<(String, Vec<PageLink>, HtmlDoc), String> {
+fn fetch_source_page(url: &str, force_js: bool) -> Result<(String, Vec<PageLink>, HtmlDoc, bool), String> {
     let html = fetch_html(url)?;
-    let title = extract_title(&html);
-    let links = extract_links(url, &html);
-    let doc = parse_html_doc(url, &html);
-    Ok((title, links, doc))
+    let mut title = extract_title(&html);
+    let mut links = extract_links(url, &html);
+    let mut doc = parse_html_doc(url, &html);
+    let mut js = false;
+    // Script-rendered shell with (almost) no readable content? Re-fetch the
+    // post-JS DOM so the page actually shows something in-app.
+    if force_js || looks_like_spa(&html, &doc) {
+        match snapshot_dom(url) {
+            Ok(dom) => {
+                let t2 = extract_title(&dom);
+                if !t2.is_empty() {
+                    title = t2;
+                }
+                links = extract_links(url, &dom);
+                doc = parse_html_doc(url, &dom);
+                js = true;
+            }
+            Err(e) => {
+                if force_js {
+                    return Err(format!("JS render failed: {e}"));
+                }
+                // auto path: keep the raw doc; the UI offers a manual retry.
+            }
+        }
+    }
+    Ok((title, links, doc, js))
+}
+
+/// Locate a chromium binary for JS rendering: $SCWOLL_CHROMIUM first,
+/// then common names on PATH (provided by shell.nix).
+fn find_chromium() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SCWOLL_CHROMIUM") {
+        let p = PathBuf::from(&p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "headless_shell"] {
+            let p = dir.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Run page JS in headless chromium and dump the resulting DOM.
+/// The virtual-time budget lets SPA boot + data fetching settle without
+/// wall-clock waiting. Runs on a worker thread; 30s hard timeout.
+fn snapshot_dom(url: &str) -> Result<String, String> {
+    let bin = find_chromium().ok_or("no chromium on PATH (launch via nix-shell for JS pages)")?;
+    let profile = std::env::temp_dir().join(format!("scwoll-chrome-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&profile).ok();
+    // `--headless=new` on recent chromium, plain `--headless` on old builds.
+    let mut last_err = String::from("chromium produced no DOM");
+    for headless in ["--headless=new", "--headless"] {
+        let mut child = Command::new(&bin)
+            .args([
+                headless,
+                "--no-sandbox",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                &format!("--user-data-dir={}", profile.display()),
+                "--virtual-time-budget=8000",
+                "--dump-dom",
+                url,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("couldn't launch chromium: {e}"))?;
+        match child.wait_timeout(Duration::from_secs(30)).map_err(|e| format!("wait failed: {e}"))? {
+            Some(status) => {
+                let out = child.wait_with_output().map_err(|e| format!("read failed: {e}"))?;
+                let dom = String::from_utf8_lossy(&out.stdout).into_owned();
+                if status.success() && dom.trim_start().starts_with('<') && dom.len() > 100 {
+                    std::fs::remove_dir_all(&profile).ok();
+                    return Ok(dom);
+                }
+                last_err = format!("chromium exited with {status} / dumped nothing");
+            }
+            None => {
+                child.kill().ok();
+                child.wait().ok();
+                std::fs::remove_dir_all(&profile).ok();
+                return Err("chromium timed out after 30s".into());
+            }
+        }
+    }
+    std::fs::remove_dir_all(&profile).ok();
+    Err(last_err)
+}
+
+/// Readable text volume of a parsed doc, in chars.
+fn doc_text_len(doc: &HtmlDoc) -> usize {
+    doc.blocks
+        .iter()
+        .map(|b| match b {
+            DocBlock::Heading { text, .. } => text.len(),
+            DocBlock::Para(s) | DocBlock::Bullet(s) | DocBlock::Numbered(_, s) | DocBlock::Quote(s) => {
+                s.iter().map(|sp| sp.text.len()).sum()
+            }
+            DocBlock::Pre(t) => t.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Big HTML shell + app-root markers + bundled scripts but (almost) no
+/// readable text: almost certainly a script-rendered page.
+fn looks_like_spa(html: &str, doc: &HtmlDoc) -> bool {
+    if doc_text_len(doc) >= 400 || html.len() < 1500 {
+        return false;
+    }
+    let low = html.to_lowercase();
+    [
+        "id=\"root\"",
+        "id=\"app\"",
+        "__next_data__",
+        "data-reactroot",
+        "ng-app",
+        "ng-version",
+        "id=\"__nuxt\"",
+        "vite",
+        "bundle.js",
+        "chunk.js",
+    ]
+    .iter()
+    .any(|m| low.contains(m))
+}
+
+/// Shown doc has basically nothing in it (used for the JS hint banner).
+fn page_looks_empty(page: &SourcePage) -> bool {
+    doc_text_len(&page.doc) < 200 && page.links.len() < 3
 }
 
 // -------------------------------------------------------- html renderer --
@@ -663,9 +803,6 @@ fn hex_to_color(hex: &str) -> egui::Color32 {
     };
     egui::Color32::from_rgb(r, g, b)
 }
-fn color_to_hex(c: egui::Color32) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
-}
 fn with_alpha(c: egui::Color32, a: u8, glass: bool) -> egui::Color32 {
     if glass {
         egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
@@ -673,6 +810,307 @@ fn with_alpha(c: egui::Color32, a: u8, glass: bool) -> egui::Color32 {
         c
     }
 }
+fn alpha_color(c: egui::Color32, a: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+fn mix_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+fn panel_alpha(theme: &Theme) -> u8 {
+    if theme.glass {
+        (theme.opacity.clamp(20, 100) as f32 * 2.35) as u8
+    } else {
+        255
+    }
+}
+fn card_alpha(theme: &Theme) -> u8 {
+    if theme.glass {
+        (theme.opacity.clamp(20, 100) as f32 * 2.05 + 18.0) as u8
+    } else {
+        255
+    }
+}
+fn input_alpha(theme: &Theme) -> u8 {
+    if theme.glass {
+        ((theme.opacity.clamp(20, 100) as f32 * 1.65) + 65.0).min(248.0) as u8
+    } else {
+        255
+    }
+}
+
+fn theme_shadow(theme: &Theme) -> egui::Shadow {
+    if theme.shadow == 0 {
+        return egui::Shadow::NONE;
+    }
+    let s = theme.shadow as f32 / 100.0;
+    let blur = 8.0 + theme.blur as f32 * 0.95 + s * 26.0;
+    let alpha = (s * 170.0 + if theme.glass { 12.0 } else { 0.0 }).min(210.0) as u8;
+    egui::Shadow {
+        offset: egui::vec2(0.0, 3.0 + s * 11.0),
+        blur,
+        spread: 0.0,
+        color: egui::Color32::from_black_alpha(alpha),
+    }
+}
+
+/// Curated looks. Presets only touch appearance/effect fields so users keep
+/// their accent and category data. The Colors tab is still fully editable.
+pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
+    match preset {
+        "Liquid Glass" => {
+            theme.glass = true;
+            theme.opacity = 68;
+            theme.blur = 26;
+            theme.shadow = 62;
+            theme.glow = 48;
+            theme.ambient = 60;
+            theme.grain = 8;
+            theme.vignette = 32;
+            theme.aurora = true;
+            theme.animate = true;
+            theme.hover_glow = true;
+            theme.radius = 22;
+        }
+        "Frosted" => {
+            theme.glass = true;
+            theme.opacity = 86;
+            theme.blur = 40;
+            theme.shadow = 38;
+            theme.glow = 16;
+            theme.ambient = 34;
+            theme.grain = 20;
+            theme.vignette = 18;
+            theme.aurora = true;
+            theme.animate = false;
+            theme.hover_glow = false;
+            theme.radius = 16;
+        }
+        "Neon" => {
+            theme.glass = true;
+            theme.opacity = 52;
+            theme.blur = 16;
+            theme.shadow = 82;
+            theme.glow = 95;
+            theme.ambient = 90;
+            theme.grain = 0;
+            theme.vignette = 58;
+            theme.aurora = true;
+            theme.animate = true;
+            theme.hover_glow = true;
+            theme.radius = 24;
+            theme.accent2 = "#ff2d95".into();
+        }
+        "OLED" => {
+            theme.glass = false;
+            theme.opacity = 100;
+            theme.blur = 0;
+            theme.shadow = 0;
+            theme.glow = 0;
+            theme.ambient = 0;
+            theme.grain = 0;
+            theme.vignette = 0;
+            theme.aurora = false;
+            theme.animate = false;
+            theme.hover_glow = false;
+            theme.radius = 10;
+            theme.background = "#000000".into();
+            theme.surface = "#08080c".into();
+            theme.surface2 = "#14141a".into();
+            theme.sidebar = "#040406".into();
+        }
+        "Minimal" => {
+            theme.glass = false;
+            theme.opacity = 100;
+            theme.blur = 0;
+            theme.shadow = 0;
+            theme.glow = 8;
+            theme.ambient = 0;
+            theme.grain = 0;
+            theme.vignette = 0;
+            theme.aurora = false;
+            theme.animate = false;
+            theme.hover_glow = true;
+            theme.radius = 8;
+        }
+        _ => {}
+    }
+}
+
+fn hash32(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    x
+}
+
+/// A soft radial blob built from a triangle fan. Two rings give a smoother
+/// falloff than a single centre-to-edge gradient, with no extra dependencies.
+fn paint_radial_glow(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    inner: egui::Color32,
+    outer: egui::Color32,
+) {
+    if radius <= 1.0 {
+        return;
+    }
+    const SEG: usize = 64;
+    let mid = alpha_color(inner, (inner.a() as f32 * 0.42) as u8);
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, inner);
+    for i in 0..SEG {
+        let a = i as f32 / SEG as f32 * std::f32::consts::TAU;
+        let p = center + egui::vec2(a.cos(), a.sin()) * (radius * 0.55);
+        mesh.colored_vertex(p, mid);
+    }
+    for i in 0..SEG {
+        let a = i as f32 / SEG as f32 * std::f32::consts::TAU;
+        let p = center + egui::vec2(a.cos(), a.sin()) * radius;
+        mesh.colored_vertex(p, outer);
+    }
+    for i in 0..SEG {
+        let a = 1 + i as u32;
+        let b = 1 + ((i + 1) % SEG) as u32;
+        let c = 1 + SEG as u32 + i as u32;
+        let d = 1 + SEG as u32 + ((i + 1) % SEG) as u32;
+        mesh.add_triangle(0, a, b);
+        mesh.add_triangle(a, c, b);
+        mesh.add_triangle(b, c, d);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Full-window backdrop: a subdued accent gradient, soft animated aurora
+/// blobs, a vignette and optional film grain. Painted on egui's background
+/// layer so every translucent glass panel picks up the colour behind it.
+fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
+    let rect = ctx.screen_rect();
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let bg = hex_to_color(&theme.background);
+    let accent = hex_to_color(&theme.accent);
+    let accent2 = hex_to_color(&theme.accent2);
+    let ambient = (theme.ambient as f32 / 100.0).clamp(0.0, 1.0);
+
+    // Base gradient: a touch of both accents at opposite corners keeps the
+    // background from looking like a flat slab even with aurora disabled.
+    let tint = if theme.aurora { 0.12 } else { 0.05 };
+    let tl = mix_color(bg, accent, tint * ambient);
+    let tr = mix_color(bg, accent2, tint * ambient * 0.85);
+    let bl = mix_color(bg, accent2, tint * ambient * 0.65);
+    let br = mix_color(bg, accent, tint * ambient * 0.75);
+    let mut base = egui::Mesh::default();
+    base.colored_vertex(rect.left_top(), tl);
+    base.colored_vertex(rect.right_top(), tr);
+    base.colored_vertex(rect.left_bottom(), bl);
+    base.colored_vertex(rect.right_bottom(), br);
+    base.add_triangle(0, 1, 2);
+    base.add_triangle(2, 1, 3);
+    painter.add(egui::Shape::mesh(base));
+
+    if theme.aurora && ambient > 0.01 {
+        let t = if theme.animate {
+            ctx.input(|i| i.time) as f32
+        } else {
+            0.0
+        };
+        let maxr = rect.width().max(rect.height());
+        let frost = (0.70 + theme.blur as f32 / 50.0).clamp(0.65, 1.9);
+        let strength = ((12.0 + ambient * 38.0) * (0.72 + theme.glow as f32 / 140.0))
+            .clamp(8.0, 86.0) as u8;
+        let blobs = [
+            (0.16, 0.24, accent, 0.50, 0.0, 0.10, 0.055),
+            (0.82, 0.18, accent2, 0.46, 1.9, 0.085, 0.075),
+            (0.68, 0.78, accent, 0.42, 3.4, 0.11, 0.065),
+            (0.22, 0.86, accent2, 0.44, 5.1, 0.075, 0.09),
+            (0.50, 0.47, mix_color(accent, accent2, 0.5), 0.34, 2.4, 0.06, 0.05),
+        ];
+        for (fx, fy, color, scale, phase, sx, sy) in blobs {
+            let ox = (t * sx + phase).sin() * rect.width() * 0.07;
+            let oy = (t * sy + phase * 1.7).cos() * rect.height() * 0.07;
+            let center = egui::pos2(
+                rect.left() + rect.width() * fx + ox,
+                rect.top() + rect.height() * fy + oy,
+            );
+            let radius = maxr * scale * frost;
+            paint_radial_glow(&painter, center, radius, alpha_color(color, strength), alpha_color(color, 0));
+        }
+    }
+
+    if theme.vignette > 0 {
+        let v = theme.vignette as f32 / 100.0;
+        let radius = rect.width().max(rect.height()) * 0.78;
+        paint_radial_glow(
+            &painter,
+            rect.center(),
+            radius,
+            alpha_color(egui::Color32::BLACK, 0),
+            egui::Color32::from_black_alpha((v * 125.0) as u8),
+        );
+    }
+
+    if theme.grain > 0 {
+        let amount = theme.grain as f32 / 100.0;
+        let count = ((rect.width() * rect.height() / 500.0) * amount) as usize;
+        let count = count.clamp(0, 5000);
+        let a = (5.0 + amount * 30.0) as u8;
+        let mut grain = egui::Mesh::default();
+        for i in 0..count {
+            let h = hash32(i as u32 ^ 0x9e37_79b9);
+            let x = rect.left() + (h & 0xffff) as f32 / 65535.0 * rect.width();
+            let y = rect.top() + ((h >> 16) & 0xffff) as f32 / 65535.0 * rect.height();
+            grain.add_colored_rect(
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(1.0, 1.0)),
+                alpha_color(egui::Color32::WHITE, a),
+            );
+        }
+        painter.add(egui::Shape::mesh(grain));
+    }
+}
+
+/// Thin one-pixel accent gradient along a panel edge. Kept in a middle
+/// layer so it sits above the panel fill but below floating windows.
+fn paint_panel_edge(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    horizontal: bool,
+    c1: egui::Color32,
+    c2: egui::Color32,
+) {
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    let id = egui::Id::new(if horizontal { "panel_edge_h" } else { "panel_edge_v" });
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, id));
+    let edge = if horizontal {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - 1.0),
+            rect.right_bottom(),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 1.0, rect.top()),
+            rect.right_bottom(),
+        )
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(edge.left_top(), c1);
+    mesh.colored_vertex(edge.right_top(), if horizontal { c2 } else { c1 });
+    mesh.colored_vertex(edge.left_bottom(), if horizontal { c1 } else { c2 });
+    mesh.colored_vertex(edge.right_bottom(), c2);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn placeholder_color(key: &str) -> egui::Color32 {
     let mut h: u32 = 7;
     for b in key.bytes() {
@@ -706,57 +1144,115 @@ fn shorten_title(title: &str, content_w: f32) -> String {
 
 
 fn apply_visuals(ctx: &egui::Context, theme: &Theme) {
-    let glass = true; // liquid glass is the only theme
+    let glass = theme.glass;
     let accent = hex_to_color(&theme.accent);
-    let bg = hex_to_color(&theme.background);
     let surface = hex_to_color(&theme.surface);
     let surface2 = hex_to_color(&theme.surface2);
     let text = hex_to_color(&theme.text);
     let muted = hex_to_color(&theme.muted);
-    let sidebar = hex_to_color(&theme.sidebar);
 
-    let bg_fill = with_alpha(bg, 235, glass);
-    let panel = with_alpha(surface, if glass { 205 } else { 255 }, glass);
-    let side = with_alpha(sidebar, if glass { 215 } else { 255 }, glass);
-    let _input = with_alpha(surface2, if glass { 220 } else { 255 }, glass);
-    let r = egui::Rounding::same(theme.radius.min(24) as f32);
+    let panel_a = panel_alpha(theme);
+    let card_a = card_alpha(theme);
+    let input_a = input_alpha(theme);
+    let r = egui::Rounding::same(theme.radius.min(26) as f32);
+    let r_small = egui::Rounding::same((theme.radius.min(16) as f32).max(4.0));
+    let rim = mix_color(muted, accent, 0.38);
+    let rim_a = (24.0 + theme.glow as f32 * 1.45).min(155.0) as u8;
+    let border = alpha_color(rim, if glass { rim_a } else { 72 });
+    let shadow = theme_shadow(theme);
 
     let mut vis = egui::Visuals::dark();
     vis.dark_mode = true;
     vis.override_text_color = Some(text);
-    vis.window_fill = panel;
-    vis.panel_fill = bg_fill;
-    vis.extreme_bg_color = with_alpha(surface2, 255, false);
-    vis.code_bg_color = with_alpha(surface2, 255, false);
-    vis.faint_bg_color = with_alpha(surface2, 255, false);
-    vis.window_stroke = egui::Stroke::new(1.0, muted.gamma_multiply(0.45));
-    vis.widgets.noninteractive.bg_fill = panel;
-    vis.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text);
-    vis.widgets.inactive.bg_fill = with_alpha(surface2, 255, false);
-    vis.widgets.hovered.bg_fill = accent.gamma_multiply(0.35);
-    vis.widgets.active.bg_fill = accent.gamma_multiply(0.55);
-    vis.selection.bg_fill = accent.gamma_multiply(0.85);
-    vis.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-    vis.hyperlink_color = accent;
+    vis.window_fill = with_alpha(surface, panel_a, glass);
+    vis.panel_fill = egui::Color32::TRANSPARENT; // backdrop shows through
+    vis.extreme_bg_color = with_alpha(surface2, input_a, glass);
+    vis.code_bg_color = alpha_color(surface2, input_a.max(150));
+    vis.faint_bg_color = alpha_color(surface2, input_a.saturating_sub(35));
+    vis.window_stroke = egui::Stroke::new(1.0_f32, border);
     vis.window_rounding = r;
     vis.menu_rounding = r;
+    vis.window_shadow = shadow;
+    vis.popup_shadow = shadow;
+    vis.window_highlight_topmost = false;
+    vis.hyperlink_color = accent;
+    vis.selection.bg_fill = accent.gamma_multiply(0.82);
+    vis.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    vis.slider_trailing_fill = true;
+    vis.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    vis.button_frame = true;
+    vis.collapsing_header_frame = false;
+    vis.striped = false;
+
+    vis.widgets.noninteractive.bg_fill = with_alpha(surface, card_a, glass);
+    vis.widgets.noninteractive.weak_bg_fill = with_alpha(surface, card_a, glass);
+    vis.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+    vis.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text);
     vis.widgets.noninteractive.rounding = r;
-    vis.widgets.inactive.rounding = r;
-    vis.widgets.hovered.rounding = r;
-    vis.widgets.active.rounding = r;
-    vis.widgets.open.rounding = r;
-    vis.window_shadow = if glass {
-        egui::Shadow {
-            offset: egui::vec2(0.0, 12.0),
-            blur: 40.0,
-            spread: 0.0,
-            color: egui::Color32::from_black_alpha(120),
-        }
-    } else {
-        egui::Shadow::NONE
-    };
-    let _ = side;
+
+    vis.widgets.inactive.bg_fill = with_alpha(surface2, input_a, glass);
+    vis.widgets.inactive.weak_bg_fill = with_alpha(surface2, input_a, glass);
+    vis.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+    vis.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text);
+    vis.widgets.inactive.rounding = r_small;
+    vis.widgets.inactive.expansion = 0.0;
+
+    vis.widgets.hovered.bg_fill = alpha_color(
+        mix_color(surface2, accent, 0.30),
+        (input_a as f32 + 22.0).min(248.0) as u8,
+    );
+    vis.widgets.hovered.weak_bg_fill = vis.widgets.hovered.bg_fill;
+    vis.widgets.hovered.bg_stroke = egui::Stroke::new(
+        1.0 + theme.glow as f32 / 110.0,
+        alpha_color(accent, (70.0 + theme.glow as f32 * 1.4).min(235.0) as u8),
+    );
+    vis.widgets.hovered.fg_stroke = egui::Stroke::new(1.5_f32, text);
+    vis.widgets.hovered.rounding = r_small;
+    vis.widgets.hovered.expansion = 1.0;
+
+    vis.widgets.active.bg_fill = alpha_color(
+        mix_color(surface2, accent, 0.50),
+        (input_a as f32 + 12.0).min(250.0) as u8,
+    );
+    vis.widgets.active.weak_bg_fill = vis.widgets.active.bg_fill;
+    vis.widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, accent);
+    vis.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+    vis.widgets.active.rounding = r_small;
+    vis.widgets.active.expansion = 0.0;
+
+    vis.widgets.open = vis.widgets.hovered;
+    vis.widgets.open.rounding = r_small;
+
     ctx.set_visuals(vis);
+    ctx.style_mut(|style| {
+        use egui::{FontFamily, FontId, TextStyle};
+        style
+            .text_styles
+            .insert(TextStyle::Heading, FontId::new(21.0, FontFamily::Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(14.5, FontFamily::Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::new(14.0, FontFamily::Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Small, FontId::new(11.5, FontFamily::Proportional));
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.interact_size.y = 24.0;
+        style.spacing.slider_width = 165.0;
+        style.spacing.window_margin = egui::Margin::same(12.0);
+        style.spacing.menu_margin = egui::Margin::same(8.0);
+        style.spacing.scroll.floating = true;
+        style.spacing.scroll.bar_width = 9.0;
+        style.spacing.scroll.floating_width = 5.0;
+        style.spacing.scroll.handle_min_length = 28.0;
+        style.spacing.scroll.dormant_handle_opacity = 0.32;
+        style.spacing.scroll.active_handle_opacity = 0.55;
+        style.spacing.scroll.interact_handle_opacity = 0.92;
+        style.spacing.scroll.foreground_color = false;
+    });
 }
 
 // ---------------------------------------------------------------- player ---
@@ -1191,6 +1687,7 @@ fn mark_thumb_failed(key: &str) {
 
 // use Read trait in fetch
 use std::io::Read as _;
+use wait_timeout::ChildExt;
 
 // --------------------------------------------------------------- app -------
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1226,6 +1723,13 @@ enum ImportTab {
     Folder,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SettingsTab {
+    Appearance,
+    Glass,
+    Colors,
+}
+
 struct ScwollApp {
     videos: Vec<Video>,
     theme: Theme,
@@ -1235,6 +1739,7 @@ struct ScwollApp {
     selected: Option<String>,
     show_import: bool,
     show_theme: bool,
+    settings_tab: SettingsTab,
     import_tab: ImportTab,
     // import buffers
     in_url: String,
@@ -1340,6 +1845,7 @@ impl ScwollApp {
             selected: None,
             show_import: false,
             show_theme: false,
+            settings_tab: SettingsTab::Appearance,
             import_tab: ImportTab::Url,
             in_url: String::new(),
             in_url_cat: String::new(),
@@ -1550,6 +2056,16 @@ impl ScwollApp {
         Ok(())
     }
     fn request_source(&mut self, id: &str, url: &str) {
+        self.request_source_inner(id, url, false);
+    }
+    /// Re-fetch forcing a post-JS DOM snapshot (manual "Load with JS").
+    fn request_source_js(&mut self, id: &str, url: &str) {
+        self.source_cache.remove(id);
+        self.source_loading.remove(id);
+        self.request_source_inner(id, url, true);
+        self.toast("Rendering page JS…");
+    }
+    fn request_source_inner(&mut self, id: &str, url: &str, force_js: bool) {
         if self.source_cache.contains_key(id) || self.source_loading.contains(id) {
             return;
         }
@@ -1558,7 +2074,7 @@ impl ScwollApp {
         let id = id.to_string();
         let url = url.to_string();
         std::thread::spawn(move || {
-            let result = fetch_source_page(&url);
+            let result = fetch_source_page(&url, force_js);
             tx.send(SourceFetchMsg { id, result }).ok();
         });
     }
@@ -1566,7 +2082,7 @@ impl ScwollApp {
         while let Ok(msg) = self.source_rx.try_recv() {
             self.source_loading.remove(&msg.id);
             let page = match msg.result {
-                Ok((title, links, doc)) => {
+                Ok((title, links, doc, js)) => {
                     // remember the page title as the source label
                     if !title.is_empty() {
                         if let Some(s) = self.sources.iter_mut().find(|s| s.id == msg.id) {
@@ -1574,9 +2090,9 @@ impl ScwollApp {
                         }
                         self.persist_sources();
                     }
-                    SourcePage { title, links, doc, fetched_at: now_iso(), error: None }
+                    SourcePage { title, links, doc, fetched_at: now_iso(), error: None, js_rendered: js }
                 }
-                Err(e) => SourcePage { title: String::new(), links: vec![], doc: HtmlDoc::default(), fetched_at: now_iso(), error: Some(e) },
+                Err(e) => SourcePage { title: String::new(), links: vec![], doc: HtmlDoc::default(), fetched_at: now_iso(), error: Some(e), js_rendered: false },
             };
             self.source_cache.insert(msg.id, page);
         }
@@ -1777,46 +2293,65 @@ fn scan_folder(root: &Path, recursive: bool) -> Vec<PathBuf> {
 impl eframe::App for ScwollApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_visuals(ctx, &self.theme);
+        paint_backdrop(ctx, &self.theme);
         self.pump_thumbs(ctx);
         self.pump_sources();
         self.pump_source_images(ctx);
-        ctx.request_repaint_after(Duration::from_millis(500));
+        let animated = self.theme.animate && self.theme.aurora && self.theme.ambient > 0;
+        ctx.request_repaint_after(Duration::from_millis(if animated { 33 } else { 500 }));
 
-        let glass = true; // liquid glass is the only theme
+        let glass = self.theme.glass;
         let accent = hex_to_color(&self.theme.accent);
+        let accent2 = hex_to_color(&self.theme.accent2);
         let muted = hex_to_color(&self.theme.muted);
-        let sidebar_fill = with_alpha(hex_to_color(&self.theme.sidebar), if glass { 215 } else { 255 }, glass);
+        let panel_a = panel_alpha(&self.theme);
+        let top_fill = with_alpha(hex_to_color(&self.theme.surface), panel_a, glass);
+        let sidebar_fill = with_alpha(hex_to_color(&self.theme.sidebar), panel_a, glass);
+        let panel_line = alpha_color(accent, (45.0 + self.theme.glow as f32 * 1.5).min(190.0) as u8);
+        let panel_line2 = alpha_color(accent2, (35.0 + self.theme.glow as f32 * 1.1).min(150.0) as u8);
 
         // ---------------- top bar ----------------
-        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("▶ Scwoll").color(accent).strong());
-                ui.label(egui::RichText::new("tube").color(muted));
-                ui.add_space(8.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search videos, categories, urls…")
-                        .desired_width(320.0),
-                );
-                if resp.changed() {}
-                if ui.button("✕").on_hover_text("Clear search").clicked() {
-                    self.search.clear();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🎨 Theme").clicked() {
-                        self.show_theme = true;
+        let top_resp = egui::TopBottomPanel::top("topbar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .fill(top_fill)
+                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("▶").color(accent).size(24.0));
+                    ui.heading(egui::RichText::new("Scwoll").color(accent).strong());
+                    ui.label(egui::RichText::new("tube").color(muted).small());
+                    ui.add_space(10.0);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search videos, categories, urls…")
+                            .desired_width(320.0),
+                    );
+                    let _ = resp;
+                    if ui.button("✕").on_hover_text("Clear search").clicked() {
+                        self.search.clear();
                     }
-                    if ui.button("＋ Import").clicked() {
-                        self.show_import = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("⚙ Settings").on_hover_text("Appearance, glass and colour options").clicked() {
+                            self.show_theme = true;
+                        }
+                        if ui.button("＋ Import").clicked() {
+                            self.show_import = true;
+                        }
+                    });
                 });
             });
-        });
+        paint_panel_edge(ctx, top_resp.response.rect, true, panel_line, panel_line2);
 
         // ---------------- sidebar ----------------
-        egui::SidePanel::left("sidebar")
+        let side_resp = egui::SidePanel::left("sidebar")
             .exact_width(228.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(sidebar_fill))
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .fill(sidebar_fill)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+            )
             .show(ctx, |ui| {
                 // One scrollbar for the whole sidebar: categories scroll with
                 // the sidebar instead of trapping scroll in a nested box.
@@ -1881,9 +2416,16 @@ impl eframe::App for ScwollApp {
                 ui.small(format!("Player: {}", if self.player.child.is_some() { "busy" } else { "idle" }));
                 });
             });
+        paint_panel_edge(ctx, side_resp.response.rect, false, panel_line, panel_line2);
 
         // ---------------- main ----------------
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&ctx.style())
+                    .fill(egui::Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
+            .show(ctx, |ui| {
             // stale source selection (deleted elsewhere)? drop it.
             if let Some(id) = self.active_source_id.clone() {
                 if !self.sources.iter().any(|s| s.id == id) {
@@ -1906,8 +2448,7 @@ impl eframe::App for ScwollApp {
         }
         if self.show_theme {
             self.theme_window(ctx, accent, muted);
-        }
-        if self.show_cats {
+        }        if self.show_cats {
             self.categories_window(ctx, muted);
         }
 
@@ -1965,10 +2506,23 @@ impl ScwollApp {
             let cols = (((avail + gap.x) / (target + gap.x)).floor() as usize).max(1);
             let card_w =
                 ((avail - gap.x * (cols.saturating_sub(1) as f32)) / cols as f32).max(110.0);
-            // Frame adds 6px inner margin per side + ~1px stroke each side.
-            let content_w = (card_w - 14.0).max(80.0);
+            // Frame adds inner margin + stroke; keep the content width a
+            // little narrower so the rounded glass card fits exactly.
+            let content_w = (card_w - 20.0).max(80.0);
             let slot_h = content_w * 9.0 / 16.0;
-            let rounding = egui::Rounding::same(self.theme.radius.min(20) as f32);
+            let rounding = egui::Rounding::same(self.theme.radius.min(22) as f32);
+            let img_rounding = egui::Rounding::same((self.theme.radius.min(18) as f32 - 2.0).max(2.0));
+            let glass = self.theme.glass;
+            let surface = hex_to_color(&self.theme.surface);
+            let card_fill = with_alpha(surface, card_alpha(&self.theme), glass);
+            let card_stroke = alpha_color(
+                mix_color(hex_to_color(&self.theme.muted), accent, 0.35),
+                (22.0 + self.theme.glow as f32 * 1.35).min(140.0) as u8,
+            );
+            let card_shadow = theme_shadow(&self.theme);
+            let hover_glow = self.theme.hover_glow;
+            let glow_width = 1.0 + self.theme.glow as f32 / 70.0;
+            let glow_color = alpha_color(accent, (115.0 + self.theme.glow as f32 * 1.2).min(245.0) as u8);
 
             // Explicit grid rows: exactly `cols` cards per row, rows stacked
             // vertically inside the scroll area. No wrap heuristics — the
@@ -1987,12 +2541,14 @@ impl ScwollApp {
                         let mut fav_toggle = false;
                         let mut new_cat: Option<String> = None;
                         // ============ video box ============
-                        // stock widgets only: no custom painting, nothing can overlap.
-                        // top row (source left, category right) / thumbnail /
-                        // one horizontal button row / title.
-                        egui::Frame::group(ui.style())
+                        // Glass card: translucent fill, accent rim, soft depth
+                        // shadow and an optional glow on hover.
+                        let card = egui::Frame::none()
+                            .fill(card_fill)
+                            .stroke(egui::Stroke::new(1.0_f32, card_stroke))
                             .rounding(rounding)
-                            .inner_margin(egui::Margin::same(6.0))
+                            .inner_margin(egui::Margin::same(8.0))
+                            .shadow(card_shadow)
                             .show(ui, |ui| {
                                 // Pin the content width so the card (content +
                                 // margins) is exactly card_w — the wrapping row
@@ -2060,15 +2616,37 @@ impl ScwollApp {
                                         egui::vec2(content_w, disp.y),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
-                                            ui.add(
+                                            let img = ui.add(
                                                 egui::Image::from_texture(tex)
                                                     .fit_to_exact_size(disp)
+                                                    .rounding(img_rounding)
                                                     .sense(egui::Sense::click()),
-                                            )
+                                            );
+                                            if img.hovered() {
+                                                let center = img.rect.center();
+                                                let r = (disp.y * 0.16).clamp(15.0, 26.0);
+                                                ui.painter().circle_filled(
+                                                    center,
+                                                    r,
+                                                    egui::Color32::from_black_alpha(130),
+                                                );
+                                                ui.painter().circle_stroke(
+                                                    center,
+                                                    r,
+                                                    egui::Stroke::new(1.0_f32, alpha_color(egui::Color32::WHITE, 110)),
+                                                );
+                                                ui.painter().text(
+                                                    center,
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "▶",
+                                                    egui::FontId::proportional(r * 0.9),
+                                                    egui::Color32::WHITE,
+                                                );
+                                            }
+                                            img.clicked()
                                         },
                                     )
                                     .inner
-                                    .clicked()
                                 } else {
                                     let letter = vid
                                         .title
@@ -2084,6 +2662,7 @@ impl ScwollApp {
                                                 .size(36.0)
                                                 .color(egui::Color32::WHITE),
                                         )
+                                        .rounding(img_rounding)
                                         .fill(placeholder_color(&vid.id)),
                                     );
                                     // Failed picture (.failed marker on disk):
@@ -2146,6 +2725,13 @@ impl ScwollApp {
                                 );
                                 });
                             });
+                        if hover_glow && card.response.hovered() {
+                            ui.painter().rect_stroke(
+                                card.response.rect.shrink(0.5),
+                                rounding,
+                                egui::Stroke::new(glow_width, glow_color),
+                            );
+                        }
                         if opened {
                             self.selected = Some(vid.id.clone());
                             self.edit_title = vid.title.clone();
@@ -2315,6 +2901,9 @@ impl ScwollApp {
                 self.source_loading.remove(&sid);
                 self.request_source(&sid, &surl);
             }
+            if ui.button("⚡ Load with JS").on_hover_text("Re-render via headless chromium (for script-rendered pages)").clicked() {
+                self.request_source_js(&sid, &surl);
+            }
             if ui.button("↗ Browser").clicked() {
                 open::that(&surl).ok();
             }
@@ -2354,6 +2943,13 @@ impl ScwollApp {
             });
             return;
         }
+        ui.horizontal(|ui| {
+            if page.js_rendered {
+                ui.label(egui::RichText::new("⚡ JS-rendered").color(accent).strong());
+            } else if page_looks_empty(&page) {
+                ui.label(egui::RichText::new("Looks script-rendered — hit ⚡ Load with JS (needs chromium via nix-shell).").color(muted).small());
+            }
+        });
         // video strip: every video found on the page, playable/importable
         let vids: Vec<PageLink> = page.links.iter().filter(|l| l.is_video).cloned().collect();
         if !vids.is_empty() {
@@ -2543,10 +3139,56 @@ impl ScwollApp {
         ui.add_space(6.0);
 
         // player screen (mpv plays in its own window; this is the controller)
-        egui::Frame::group(ui.style()).fill(egui::Color32::BLACK).show(ui, |ui| {
-            ui.set_min_height(300.0);
+        let thumb = self.thumb_cache.get(&v.id).map(|t| (t.id(), t.size()));
+        let glass = self.theme.glass;
+        let screen_rounding = egui::Rounding::same(self.theme.radius.min(22) as f32);
+        let screen_fill = alpha_color(
+            egui::Color32::from_rgb(4, 5, 9),
+            if glass { 238 } else { 255 },
+        );
+        let screen_stroke = egui::Stroke::new(
+            1.0_f32,
+            alpha_color(
+                accent,
+                (45.0 + self.theme.glow as f32 * 1.3).min(180.0) as u8,
+            ),
+        );
+        let screen_shadow = theme_shadow(&self.theme);
+        egui::Frame::none()
+            .fill(screen_fill)
+            .rounding(screen_rounding)
+            .stroke(screen_stroke)
+            .shadow(screen_shadow)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+            let bg_rect = egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(ui.available_width(), 330.0),
+            );
+            if let Some((tex_id, size)) = thumb {
+                let iw = size[0].max(1) as f32;
+                let ih = size[1].max(1) as f32;
+                let scale = (bg_rect.width() / iw).max(bg_rect.height() / ih);
+                let target = egui::Rect::from_center_size(
+                    bg_rect.center(),
+                    egui::vec2(iw * scale, ih * scale),
+                );
+                let painter = ui.painter().with_clip_rect(bg_rect);
+                painter.image(
+                    tex_id,
+                    target,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_white_alpha(if glass { 90 } else { 60 }),
+                );
+                painter.rect_filled(
+                    bg_rect,
+                    screen_rounding,
+                    egui::Color32::from_black_alpha(if glass { 118 } else { 150 }),
+                );
+            }
+            ui.set_min_height(330.0);
             ui.vertical_centered(|ui| {
-                ui.add_space(60.0);
+                ui.add_space(70.0);
                 let playing = self.player.is_playing(&v.id);
                 ui.label(egui::RichText::new(if playing { "▶ NOW PLAYING (mpv window)" } else { "🎬 READY" }).color(egui::Color32::WHITE).heading());
                 ui.label(egui::RichText::new(v.title.clone()).color(egui::Color32::WHITE).strong());
@@ -2766,73 +3408,242 @@ impl ScwollApp {
         self.show_import = open;
     }
 
-    fn theme_window(&mut self, ctx: &egui::Context, accent: egui::Color32, _muted: egui::Color32) {
+    fn theme_window(&mut self, ctx: &egui::Context, _accent: egui::Color32, muted: egui::Color32) {
         let mut open = self.show_theme;
-        egui::Window::new("🎨 Theme & colors")
+        let mut changed = false;
+        let mut preset_msg: Option<String> = None;
+        egui::Window::new("⚙ Settings")
             .open(&mut open)
             .resizable(true)
-            .default_width(420.0)
+            .default_width(465.0)
+            .max_height(650.0)
             .show(ctx, |ui| {
-                // color rows
-                let fields: [(&str, &str); 7] = [
-                    ("accent", "Accent"),
-                    ("background", "Background"),
-                    ("surface", "Cards / windows"),
-                    ("surface2", "Inputs"),
-                    ("text", "Text"),
-                    ("muted", "Muted"),
-                    ("sidebar", "Sidebar"),
-                ];
-                for (key, label) in fields {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{label}:"));
-                        let hex = match key {
-                            "accent" => &mut self.theme.accent,
-                            "background" => &mut self.theme.background,
-                            "surface" => &mut self.theme.surface,
-                            "surface2" => &mut self.theme.surface2,
-                            "text" => &mut self.theme.text,
-                            "muted" => &mut self.theme.muted,
-                            "sidebar" => &mut self.theme.sidebar,
-                            _ => &mut self.theme.accent,
-                        };
-                        let mut col = hex_to_color(hex);
-                        let mut rgb = [col.r(), col.g(), col.b()];
-                        if ui.color_edit_button_srgb(&mut rgb).changed() {
-                            *hex = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
-                        }
-                        let _ = col;
-                        ui.monospace(hex.clone());
-                    });
-                }
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "✨ Appearance");
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Glass, "🧊 Glass & motion");
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Colors, "🎨 Colors");
+                });
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Corner radius:");
-                    ui.add(egui::Slider::new(&mut self.theme.radius, 0..=24));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Box size:");
-                    ui.add(
-                        egui::Slider::new(&mut self.theme.card_scale, 0.6..=1.6)
-                            .suffix("\u{d7}")
-                            .show_value(true),
-                    );
-                });
-                let _ = accent;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(535.0)
+                    .show(ui, |ui| {
+                        match self.settings_tab {
+                            SettingsTab::Appearance => {
+                                ui.label(egui::RichText::new("Presets").strong());
+                                ui.horizontal_wrapped(|ui| {
+                                    for name in ["Liquid Glass", "Frosted", "Neon", "OLED", "Minimal"] {
+                                        if ui.button(name).clicked() {
+                                            apply_theme_preset(&mut self.theme, name);
+                                            preset_msg = Some(name.to_string());
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                ui.separator();
+                                let glass_resp = ui
+                                    .checkbox(&mut self.theme.glass, "Liquid glass panels")
+                                    .on_hover_text("Translucent surfaces, soft shadows and accent rim lights");
+                                if glass_resp.changed() {
+                                    changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.theme.opacity, 20..=100)
+                                            .text("Panel opacity")
+                                            .suffix("%"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .add(egui::Slider::new(&mut self.theme.radius, 0..=28).text("Corner radius"))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.theme.shadow, 0..=100)
+                                            .text("Shadow / depth"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.theme.glow, 0..=100)
+                                            .text("Accent glow"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .checkbox(&mut self.theme.hover_glow, "Accent rim on card hover")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.theme.card_scale, 0.6..=1.6)
+                                            .text("Card size")
+                                            .suffix("×"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Tip: turn Liquid glass on with a warm accent and the Aurora background for the signature Scwoll look.",
+                                    )
+                                    .color(muted)
+                                    .small(),
+                                );
+                            }
+                            SettingsTab::Glass => {
+                                ui.label(egui::RichText::new("Glass & backdrop").strong());
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.theme.blur, 0..=40)
+                                            .text("Frost / blur"),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "egui cannot sample the desktop behind the window, so blur is a soft translucent simulation: higher values widen the frosted tint and background light.",
+                                    )
+                                    .color(muted)
+                                    .small(),
+                                );
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.label(egui::RichText::new("Aurora background").strong());
+                                if ui
+                                    .checkbox(&mut self.theme.aurora, "Coloured ambient blobs behind the UI")
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.add_enabled_ui(self.theme.aurora, |ui| {
+                                    if ui
+                                        .checkbox(&mut self.theme.animate, "Animate the aurora")
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut self.theme.ambient, 0..=100)
+                                                .text("Aurora intensity"),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.label(egui::RichText::new("Atmosphere").strong());
+                                if ui
+                                    .add(egui::Slider::new(&mut self.theme.grain, 0..=100).text("Film grain"))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                if ui
+                                    .add(egui::Slider::new(&mut self.theme.vignette, 0..=100).text("Vignette"))
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Motion can be disabled independently of the aurora; the UI stays static when both are off.",
+                                    )
+                                    .color(muted)
+                                    .small(),
+                                );
+                            }
+                            SettingsTab::Colors => {
+                                ui.label(egui::RichText::new("Palette").strong());
+                                let fields: [(&str, &str); 8] = [
+                                    ("accent", "Accent"),
+                                    ("accent2", "Accent 2 / aurora"),
+                                    ("background", "Background"),
+                                    ("surface", "Cards / windows"),
+                                    ("surface2", "Inputs"),
+                                    ("text", "Text"),
+                                    ("muted", "Muted text"),
+                                    ("sidebar", "Sidebar"),
+                                ];
+                                for (key, label) in fields {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{label}:"));
+                                        let hex = match key {
+                                            "accent" => &mut self.theme.accent,
+                                            "accent2" => &mut self.theme.accent2,
+                                            "background" => &mut self.theme.background,
+                                            "surface" => &mut self.theme.surface,
+                                            "surface2" => &mut self.theme.surface2,
+                                            "text" => &mut self.theme.text,
+                                            "muted" => &mut self.theme.muted,
+                                            "sidebar" => &mut self.theme.sidebar,
+                                            _ => &mut self.theme.accent,
+                                        };
+                                        let col = hex_to_color(hex);
+                                        let mut rgb = [col.r(), col.g(), col.b()];
+                                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                                            *hex = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                                            changed = true;
+                                        }
+                                        ui.monospace(hex.clone());
+                                    });
+                                }
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("⇄ Swap accents").clicked() {
+                                        std::mem::swap(&mut self.theme.accent, &mut self.theme.accent2);
+                                        changed = true;
+                                    }
+                                });
+                                ui.small("Accent 2 is used by the background aurora and gradient panel edges.");
+                            }
+                        }
+                    });
+                ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Reset defaults").clicked() {
                         self.theme = Theme::default();
+                        changed = true;
+                        preset_msg = Some("Defaults restored".into());
                     }
-                    if ui.button("💾 Save theme").clicked() {
+                    if ui.button("💾 Save").clicked() {
                         save_theme(&self.theme);
-                        self.toast("Theme saved ✓");
+                        preset_msg = Some("Settings saved".into());
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new("auto-saved to data/theme.json").color(muted).small());
+                    });
                 });
-                ui.small("Saved to data/theme.json");
             });
         self.show_theme = open;
-        // autosave on close/change? save on each change is cheap:
-        save_theme(&self.theme);
+        if changed {
+            save_theme(&self.theme);
+        }
+        if let Some(msg) = preset_msg {
+            self.toast(msg);
+        }
     }
 
     fn categories_window(&mut self, ctx: &egui::Context, muted: egui::Color32) {
@@ -2956,5 +3767,57 @@ mod thumb_tests {
         assert!(first.0 > first.1 && first.0 > first.2, "first cell not red: {first:?}");
         assert!(last.1 > last.0 && last.2 > last.0, "last cell not cyan: {last:?}");
         std::fs::remove_file(&vid).ok();
+    }
+}
+
+#[cfg(test)]
+mod source_js_tests {
+    use super::*;
+
+    fn spa_shell() -> String {
+        // padding lives inside <script> (skipped text) so the shell stays big
+        // but yields (almost) no readable content — like a real SPA shell.
+        format!(
+            "<html><head><title>App</title><script src=\"/static/bundle.js\">var p=\"{}\";</script></head>\
+             <body><div id=\"root\"></div><noscript>need js</noscript></body></html>",
+            "x".repeat(3000)
+        )
+    }
+
+    #[test]
+    fn detects_spa_shell() {
+        let html = spa_shell();
+        let doc = parse_html_doc("https://example.com/", &html);
+        assert!(doc_text_len(&doc) < 400);
+        assert!(looks_like_spa(&html, &doc));
+    }
+
+    #[test]
+    fn plain_article_is_not_spa() {
+        let body = "lorem ipsum ".repeat(80); // ~960 chars of text
+        let html = format!("<html><head><title>T</title></head><body><p>{body}</p></body></html>");
+        let doc = parse_html_doc("https://example.com/", &html);
+        assert!(doc_text_len(&doc) >= 400);
+        assert!(!looks_like_spa(&html, &doc));
+    }
+
+    #[test]
+    fn tiny_pages_never_spa() {
+        let html = "<html><body><div id=\"root\"></div></body></html>";
+        let doc = parse_html_doc("https://example.com/", html);
+        assert!(!looks_like_spa(html, &doc));
+    }
+
+    #[test]
+    fn empty_page_hint() {
+        let page = SourcePage {
+            title: String::new(),
+            links: vec![],
+            doc: HtmlDoc::default(),
+            fetched_at: now_iso(),
+            error: None,
+            js_rendered: false,
+        };
+        assert!(page_looks_empty(&page));
     }
 }

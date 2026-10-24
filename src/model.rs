@@ -56,8 +56,43 @@ pub struct Theme {
     pub sidebar: String,
     #[serde(default = "default_radius")]
     pub radius: u8,
+    /// Liquid-glass mode: translucent panels, soft borders and shadows.
+    #[serde(default = "default_glass")]
+    pub glass: bool,
+    /// Simulated frosting strength (0-40). egui cannot blur the backdrop,
+    /// so this drives the softness of the glass tint and glow blobs.
     #[serde(default = "default_blur")]
     pub blur: u8,
+    /// Panel opacity in percent (20-100). Ignored when `glass` is off.
+    #[serde(default = "default_opacity")]
+    pub opacity: u8,
+    /// Drop-shadow strength (0-100).
+    #[serde(default = "default_shadow")]
+    pub shadow: u8,
+    /// Accent glow / rim-light strength for cards, panels and focus rings.
+    #[serde(default = "default_glow")]
+    pub glow: u8,
+    /// Animated aurora background strength (0-100).
+    #[serde(default = "default_ambient")]
+    pub ambient: u8,
+    /// Film-grain overlay (0-100).
+    #[serde(default = "default_grain")]
+    pub grain: u8,
+    /// Darkened screen edges (0-100).
+    #[serde(default = "default_vignette")]
+    pub vignette: u8,
+    /// Paint the coloured aurora blobs behind the UI.
+    #[serde(default = "default_aurora")]
+    pub aurora: bool,
+    /// Animate the aurora / background.
+    #[serde(default = "default_animate")]
+    pub animate: bool,
+    /// Highlight cards with an accent rim on hover.
+    #[serde(default = "default_hover_glow")]
+    pub hover_glow: bool,
+    /// Secondary colour used by gradients and the aurora background.
+    #[serde(default = "c_accent2")]
+    pub accent2: String,
     #[serde(default = "default_card_scale")]
     pub card_scale: f32,
 }
@@ -89,8 +124,41 @@ fn c_sidebar() -> String {
 fn default_radius() -> u8 {
     16
 }
+fn default_glass() -> bool {
+    true
+}
 fn default_blur() -> u8 {
     22
+}
+fn default_opacity() -> u8 {
+    72
+}
+fn default_shadow() -> u8 {
+    55
+}
+fn default_glow() -> u8 {
+    40
+}
+fn default_ambient() -> u8 {
+    55
+}
+fn default_grain() -> u8 {
+    8
+}
+fn default_vignette() -> u8 {
+    30
+}
+fn default_aurora() -> bool {
+    true
+}
+fn default_animate() -> bool {
+    true
+}
+fn default_hover_glow() -> bool {
+    true
+}
+fn c_accent2() -> String {
+    "#7c5cff".into()
 }
 fn default_card_scale() -> f32 {
     1.0
@@ -108,7 +176,18 @@ impl Default for Theme {
             muted: c_muted(),
             sidebar: c_sidebar(),
             radius: default_radius(),
+            glass: default_glass(),
             blur: default_blur(),
+            opacity: default_opacity(),
+            shadow: default_shadow(),
+            glow: default_glow(),
+            ambient: default_ambient(),
+            grain: default_grain(),
+            vignette: default_vignette(),
+            aurora: default_aurora(),
+            animate: default_animate(),
+            hover_glow: default_hover_glow(),
+            accent2: c_accent2(),
             card_scale: default_card_scale(),
         }
     }

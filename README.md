@@ -17,10 +17,18 @@
   square-cropped and tiled 3×2. Two engines: `ffprobe`+`ffmpeg` (fast, precise)
   then pure-`mpv` percent-seeks (works anywhere `mpv` exists, incl. YouTube
   links). Cached in `data/thumbs/`; last resort is a letter tile
-- **Themes** (`🎨 Theme`)
-  - ✨ **Liquid Glass** — translucent panels, soft shadows, rounded corners
-  - ◻ **Minimal** — opaque, sharp, flat
-  - Fully customizable: accent, background, cards, inputs, text, muted, sidebar + corner radius + glass glow. Saved to `data/theme.json`
+- **Themes & visual effects** (`⚙ Settings`)
+  - **Presets** — ✨ Liquid Glass, Frosted, Neon, OLED, Minimal
+  - **Liquid glass** toggle with panel opacity, corner radius, card size,
+    shadow/depth and accent glow
+  - **Frost / blur** slider (simulated translucent frosting), animated
+    **aurora background** with intensity + motion toggle, film grain and
+    vignette
+  - Hover rim-light on cards, accent gradient panel edges, glass cards and
+    rounded thumbnails with a play overlay
+  - Fully customizable colors: accent, accent 2 / aurora, background,
+    cards/windows, inputs, text, muted text and sidebar. Saved to
+    `data/theme.json`
 - **Persistence** — `data/library.json` + `data/theme.json` (3 demo videos seeded on first run)
 
 ## Run
@@ -71,4 +79,7 @@ nix-shell --command "cargo test"
 
 - Folder import paths are local paths on the machine running the app (native file picker included).
 - YouTube titles import as `YouTube • <id>` — rename them in the theater view.
-- `egui` can't do real backdrop blur, so Liquid Glass is simulated with translucency + shadows on a transparent viewport.
+- `egui` can't do real backdrop blur, so Liquid Glass uses translucent panels
+  over a soft animated aurora backdrop, accent rims and layered shadows to
+  simulate frosting. The **Frost / blur** slider controls how wide and soft
+  that simulated frosting looks.

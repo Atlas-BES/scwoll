@@ -1,2 +1,7 @@
 /target
 /data
+/dist
+*.AppImage
+*.AppImage.*
+Scwoll.AppDir/
+scwoll-*/

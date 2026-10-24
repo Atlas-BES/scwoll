@@ -20,3 +20,4 @@ rfd = "0.15"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5"
+wait-timeout = "0.2"
