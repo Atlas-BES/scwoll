@@ -66,6 +66,126 @@ fn save_theme(theme: &Theme) {
     }
 }
 
+// ------------------------------------------------------------------ fonts --
+#[derive(Debug, Clone)]
+struct SystemFont {
+    family: String,
+    path: PathBuf,
+    /// Face index inside the file (collections such as .ttc can hold several).
+    index: u32,
+}
+
+/// Enumerate installed font families through fontconfig. One regular face per
+/// family is kept; the list is sorted so the picker is predictable.
+fn list_system_fonts() -> Vec<SystemFont> {
+    let Ok(output) = Command::new("fc-list")
+        .args([
+            "--format",
+            "%{family[0]}\t%{style[0]}\t%{index}\t%{file}\n",
+        ])
+        .output()
+    else {
+        return vec![];
+    };
+    if !output.status.success() {
+        return vec![];
+    }
+
+    let mut fonts: BTreeMap<String, SystemFont> = BTreeMap::new();
+    let mut ranks: BTreeMap<String, u8> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.splitn(4, '\t');
+        let family = parts.next().unwrap_or("").trim();
+        let style = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        // fontconfig packs named-instance/weight bits into the high bytes for
+        // variable collections; the low 16 bits are the real face index.
+        let index = parts
+            .next()
+            .unwrap_or("0")
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0)
+            & 0xFFFF;
+        let path = parts.next().unwrap_or("").trim();
+        if family.is_empty() || path.is_empty() {
+            continue;
+        }
+        // egui's text stack needs OpenType outlines; skip bitmap/Type1 fonts.
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc") {
+            continue;
+        }
+        let rank = if style.is_empty() || style.contains("regular") || style.contains("book") {
+            0
+        } else if style.contains("medium") || style.contains("roman") {
+            1
+        } else {
+            2
+        };
+        if rank < ranks.get(family).copied().unwrap_or(u8::MAX) {
+            ranks.insert(family.to_string(), rank);
+            fonts.insert(
+                family.to_string(),
+                SystemFont {
+                    family: family.to_string(),
+                    path: PathBuf::from(path),
+                    index,
+                },
+            );
+        }
+    }
+    fonts.into_values().collect()
+}
+
+/// Install the chosen font as the first proportional face. egui's bundled
+/// fonts stay in the fallback chain, so missing glyphs/emoji still render.
+fn apply_ui_font(ctx: &egui::Context, font: Option<&SystemFont>) -> Result<(), String> {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(font) = font {
+        let bytes = std::fs::read(&font.path)
+            .map_err(|e| format!("Could not read {}: {e}", font.path.display()))?;
+        let supported = bytes.starts_with(b"ttcf")
+            || bytes.starts_with(b"OTTO")
+            || bytes.starts_with(b"true")
+            || bytes.starts_with(b"typ1")
+            || bytes.starts_with(&[0, 1, 0, 0]);
+        if !supported {
+            return Err(format!(
+                "{} is not a supported OpenType/TrueType font",
+                font.path.display()
+            ));
+        }
+        let mut index = font.index;
+        if bytes.starts_with(b"ttcf") {
+            // Never ask ab_glyph for a collection face that does not exist.
+            let faces = if bytes.len() >= 12 {
+                u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as u32
+            } else {
+                0
+            };
+            if faces == 0 || index >= faces {
+                index = 0;
+            }
+        } else {
+            index = 0;
+        }
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = index;
+        fonts.font_data.insert("scwoll-ui-font".to_owned(), data);
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "scwoll-ui-font".to_owned());
+    }
+    ctx.set_fonts(fonts);
+    Ok(())
+}
+
 // --------------------------------------------------------------- sources --
 // Bookmarked HTML pages the user can browse inside the app for videos and
 // links. Stored in data/sources.json (separate from library.json so old
@@ -819,6 +939,281 @@ fn mix_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
+/// Blend two premultiplied colours, including their alpha. Unlike `mix_color`
+/// this keeps translucent glass surfaces translucent while they animate.
+fn mix_color_premul(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let a = a.to_array();
+    let b = b.to_array();
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgba_premultiplied(
+        mix(a[0], b[0]),
+        mix(a[1], b[1]),
+        mix(a[2], b[2]),
+        mix(a[3], b[3]),
+    )
+}
+
+/// Button / selectable-label replacement with a smooth hover animation.
+///
+/// egui's stock widgets switch between visual states instantly; this widget
+/// interpolates fill, stroke, text colour and expansion over ~160 ms so every
+/// button in the app responds fluidly to the pointer.
+struct AnimatedButton {
+    text: egui::WidgetText,
+    fill: Option<egui::Color32>,
+    rounding: Option<egui::Rounding>,
+    small: bool,
+    selected: bool,
+    selectable: bool,
+}
+
+impl AnimatedButton {
+    fn new(text: impl Into<egui::WidgetText>) -> Self {
+        Self {
+            text: text.into(),
+            fill: None,
+            rounding: None,
+            small: false,
+            selected: false,
+            selectable: false,
+        }
+    }
+
+    fn selectable(selected: bool, text: impl Into<egui::WidgetText>) -> Self {
+        Self {
+            selected,
+            selectable: true,
+            ..Self::new(text)
+        }
+    }
+
+    fn fill(mut self, fill: impl Into<egui::Color32>) -> Self {
+        self.fill = Some(fill.into());
+        self
+    }
+
+    fn rounding(mut self, rounding: impl Into<egui::Rounding>) -> Self {
+        self.rounding = Some(rounding.into());
+        self
+    }
+
+    fn small(mut self) -> Self {
+        self.text = self.text.text_style(egui::TextStyle::Body);
+        self.small = true;
+        self
+    }
+}
+
+impl egui::Widget for AnimatedButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let mut padding = ui.spacing().button_padding;
+        if self.small {
+            padding.y = 0.0;
+        }
+        let wrap_width = (ui.available_width() - padding.x * 2.0).max(0.0);
+        let galley = self
+            .text
+            .into_galley(ui, None, wrap_width, egui::TextStyle::Button);
+
+        let mut size = galley.size() + padding * 2.0;
+        if !self.small {
+            size.y = size.y.max(ui.spacing().interact_size.y);
+        }
+        size.x = size.x.max(1.0);
+        size.y = size.y.max(1.0);
+
+        let (rect, response) = ui.allocate_at_least(size, egui::Sense::click());
+        let label = galley.text().to_owned();
+        if self.selectable {
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    ui.is_enabled(),
+                    self.selected,
+                    label.clone(),
+                )
+            });
+        } else {
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.clone())
+            });
+        }
+
+        if ui.is_rect_visible(rect) {
+            let hovered = response.hovered() || response.highlighted() || response.has_focus();
+            let hover_t = ui.ctx().animate_bool_with_time(
+                response.id.with("scwoll-hover"),
+                hovered,
+                0.16,
+            );
+            let press_t = ui.ctx().animate_bool_with_time(
+                response.id.with("scwoll-press"),
+                response.is_pointer_button_down_on(),
+                0.07,
+            );
+
+            let widgets = &ui.visuals().widgets;
+            let base_fill = if self.selectable {
+                if self.selected {
+                    ui.visuals().selection.bg_fill
+                } else {
+                    egui::Color32::TRANSPARENT
+                }
+            } else if let Some(fill) = self.fill {
+                fill
+            } else {
+                widgets.inactive.weak_bg_fill
+            };
+            let hover_fill = if let Some(fill) = self.fill {
+                mix_color_premul(fill, egui::Color32::WHITE, 0.16)
+            } else if self.selectable && self.selected {
+                mix_color_premul(ui.visuals().selection.bg_fill, egui::Color32::WHITE, 0.10)
+            } else {
+                widgets.hovered.weak_bg_fill
+            };
+            let active_fill = if let Some(fill) = self.fill {
+                mix_color_premul(fill, egui::Color32::WHITE, 0.26)
+            } else {
+                widgets.active.weak_bg_fill
+            };
+            let fill = mix_color_premul(
+                mix_color_premul(base_fill, hover_fill, hover_t),
+                active_fill,
+                press_t,
+            );
+
+            let base_stroke = if self.selectable {
+                if self.selected {
+                    ui.visuals().selection.stroke
+                } else {
+                    egui::Stroke::NONE
+                }
+            } else {
+                widgets.inactive.bg_stroke
+            };
+            let hover_stroke = widgets.hovered.bg_stroke;
+            let stroke = egui::Stroke::new(
+                base_stroke.width + (hover_stroke.width - base_stroke.width) * hover_t,
+                mix_color_premul(base_stroke.color, hover_stroke.color, hover_t),
+            );
+            let rounding = self.rounding.unwrap_or(widgets.inactive.rounding);
+            let expansion = widgets.inactive.expansion
+                + (widgets.hovered.expansion - widgets.inactive.expansion) * hover_t
+                - press_t * 0.5;
+            let frame_rect = rect.expand(expansion);
+            let show_frame = !self.selectable || self.selected || hover_t > 0.001;
+
+            if show_frame {
+                if hover_t > 0.001 {
+                    let glow = alpha_color(hover_stroke.color, (hover_t * 42.0) as u8);
+                    ui.painter().rect_stroke(
+                        frame_rect.expand(1.5 + hover_t * 2.0),
+                        rounding,
+                        egui::Stroke::new(1.5_f32, glow),
+                    );
+                }
+                ui.painter().rect(frame_rect, rounding, fill, stroke);
+            }
+
+            let base_fg = if self.selected {
+                ui.visuals().selection.stroke.color
+            } else {
+                widgets.inactive.fg_stroke.color
+            };
+            let text_color = mix_color_premul(base_fg, widgets.hovered.fg_stroke.color, hover_t);
+            let text_pos = ui
+                .layout()
+                .align_size_within_rect(galley.size(), rect.shrink2(padding))
+                .min;
+            ui.painter().galley(text_pos, galley, text_color);
+        }
+
+        if let Some(cursor) = ui.visuals().interact_cursor {
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(cursor);
+            }
+        }
+
+        response
+    }
+}
+
+trait AnimatedWidgets {
+    fn anim_button(&mut self, text: impl Into<egui::WidgetText>) -> egui::Response;
+    fn anim_small_button(&mut self, text: impl Into<egui::WidgetText>) -> egui::Response;
+    fn anim_selectable_label(
+        &mut self,
+        selected: bool,
+        text: impl Into<egui::WidgetText>,
+    ) -> egui::Response;
+    fn anim_selectable_value<T: PartialEq>(
+        &mut self,
+        current: &mut T,
+        selected_value: T,
+        text: impl Into<egui::WidgetText>,
+    ) -> egui::Response;
+}
+
+impl AnimatedWidgets for egui::Ui {
+    fn anim_button(&mut self, text: impl Into<egui::WidgetText>) -> egui::Response {
+        self.add(AnimatedButton::new(text))
+    }
+
+    fn anim_small_button(&mut self, text: impl Into<egui::WidgetText>) -> egui::Response {
+        self.add(AnimatedButton::new(text).small())
+    }
+
+    fn anim_selectable_label(
+        &mut self,
+        selected: bool,
+        text: impl Into<egui::WidgetText>,
+    ) -> egui::Response {
+        self.add(AnimatedButton::selectable(selected, text))
+    }
+
+    fn anim_selectable_value<T: PartialEq>(
+        &mut self,
+        current: &mut T,
+        selected_value: T,
+        text: impl Into<egui::WidgetText>,
+    ) -> egui::Response {
+        let selected = *current == selected_value;
+        let mut response = self.anim_selectable_label(selected, text);
+        if response.clicked() && *current != selected_value {
+            *current = selected_value;
+            response.mark_changed();
+        }
+        response
+    }
+}
+
+/// The project logo, embedded at compile time so it works no matter which
+/// directory the binary is launched from (and inside AppImages/tarballs).
+const LOGO_PNG: &[u8] = include_bytes!("../logo.png");
+
+fn logo_rgba() -> image::RgbaImage {
+    image::load_from_memory(LOGO_PNG)
+        .expect("bundled logo.png could not be decoded")
+        .to_rgba8()
+}
+
+fn logo_color_image() -> egui::ColorImage {
+    let rgba = logo_rgba();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw())
+}
+
+fn logo_icon_data() -> egui::IconData {
+    let rgba = logo_rgba();
+    let (width, height) = rgba.dimensions();
+    egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn panel_alpha(theme: &Theme) -> u8 {
     if theme.glass {
         (theme.opacity.clamp(20, 100) as f32 * 2.35) as u8
@@ -863,6 +1258,7 @@ pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
         "Liquid Glass" => {
             theme.glass = true;
             theme.opacity = 68;
+            theme.background_transparency = 5;
             theme.blur = 26;
             theme.shadow = 62;
             theme.glow = 48;
@@ -877,6 +1273,7 @@ pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
         "Frosted" => {
             theme.glass = true;
             theme.opacity = 86;
+            theme.background_transparency = 20;
             theme.blur = 40;
             theme.shadow = 38;
             theme.glow = 16;
@@ -891,6 +1288,7 @@ pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
         "Neon" => {
             theme.glass = true;
             theme.opacity = 52;
+            theme.background_transparency = 60;
             theme.blur = 16;
             theme.shadow = 82;
             theme.glow = 95;
@@ -906,6 +1304,7 @@ pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
         "OLED" => {
             theme.glass = false;
             theme.opacity = 100;
+            theme.background_transparency = 0;
             theme.blur = 0;
             theme.shadow = 0;
             theme.glow = 0;
@@ -924,6 +1323,7 @@ pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
         "Minimal" => {
             theme.glass = false;
             theme.opacity = 100;
+            theme.background_transparency = 0;
             theme.blur = 0;
             theme.shadow = 0;
             theme.glow = 8;
@@ -999,14 +1399,18 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
     let accent = hex_to_color(&theme.accent);
     let accent2 = hex_to_color(&theme.accent2);
     let ambient = (theme.ambient as f32 / 100.0).clamp(0.0, 1.0);
+    let bg_opacity = 1.0 - theme.background_transparency.min(100) as f32 / 100.0;
+    let bg_alpha = (bg_opacity * 255.0).round() as u8;
 
     // Base gradient: a touch of both accents at opposite corners keeps the
     // background from looking like a flat slab even with aurora disabled.
+    // The alpha comes from the transparency setting so the desktop can show
+    // through when the window's compositor supports it.
     let tint = if theme.aurora { 0.12 } else { 0.05 };
-    let tl = mix_color(bg, accent, tint * ambient);
-    let tr = mix_color(bg, accent2, tint * ambient * 0.85);
-    let bl = mix_color(bg, accent2, tint * ambient * 0.65);
-    let br = mix_color(bg, accent, tint * ambient * 0.75);
+    let tl = alpha_color(mix_color(bg, accent, tint * ambient), bg_alpha);
+    let tr = alpha_color(mix_color(bg, accent2, tint * ambient * 0.85), bg_alpha);
+    let bl = alpha_color(mix_color(bg, accent2, tint * ambient * 0.65), bg_alpha);
+    let br = alpha_color(mix_color(bg, accent, tint * ambient * 0.75), bg_alpha);
     let mut base = egui::Mesh::default();
     base.colored_vertex(rect.left_top(), tl);
     base.colored_vertex(rect.right_top(), tr);
@@ -1016,7 +1420,7 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
     base.add_triangle(2, 1, 3);
     painter.add(egui::Shape::mesh(base));
 
-    if theme.aurora && ambient > 0.01 {
+    if theme.aurora && ambient > 0.01 && bg_opacity > 0.0 {
         let t = if theme.animate {
             ctx.input(|i| i.time) as f32
         } else {
@@ -1024,8 +1428,9 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
         };
         let maxr = rect.width().max(rect.height());
         let frost = (0.70 + theme.blur as f32 / 50.0).clamp(0.65, 1.9);
-        let strength = ((12.0 + ambient * 38.0) * (0.72 + theme.glow as f32 / 140.0))
-            .clamp(8.0, 86.0) as u8;
+        let strength = (((12.0 + ambient * 38.0) * (0.72 + theme.glow as f32 / 140.0))
+            .clamp(8.0, 86.0)
+            * bg_opacity) as u8;
         let blobs = [
             (0.16, 0.24, accent, 0.50, 0.0, 0.10, 0.055),
             (0.82, 0.18, accent2, 0.46, 1.9, 0.085, 0.075),
@@ -1045,7 +1450,7 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
         }
     }
 
-    if theme.vignette > 0 {
+    if theme.vignette > 0 && bg_opacity > 0.0 {
         let v = theme.vignette as f32 / 100.0;
         let radius = rect.width().max(rect.height()) * 0.78;
         paint_radial_glow(
@@ -1053,15 +1458,15 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
             rect.center(),
             radius,
             alpha_color(egui::Color32::BLACK, 0),
-            egui::Color32::from_black_alpha((v * 125.0) as u8),
+            egui::Color32::from_black_alpha((v * 125.0 * bg_opacity) as u8),
         );
     }
 
-    if theme.grain > 0 {
+    if theme.grain > 0 && bg_opacity > 0.0 {
         let amount = theme.grain as f32 / 100.0;
         let count = ((rect.width() * rect.height() / 500.0) * amount) as usize;
         let count = count.clamp(0, 5000);
-        let a = (5.0 + amount * 30.0) as u8;
+        let a = ((5.0 + amount * 30.0) * bg_opacity) as u8;
         let mut grain = egui::Mesh::default();
         for i in 0..count {
             let h = hash32(i as u32 ^ 0x9e37_79b9);
@@ -1726,6 +2131,7 @@ enum ImportTab {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SettingsTab {
     Appearance,
+    Font,
     Glass,
     Colors,
 }
@@ -1733,6 +2139,7 @@ enum SettingsTab {
 struct ScwollApp {
     videos: Vec<Video>,
     theme: Theme,
+    logo_tex: egui::TextureHandle,
     active_category: String,
     source: SourceFilter,
     search: String,
@@ -1740,6 +2147,8 @@ struct ScwollApp {
     show_import: bool,
     show_theme: bool,
     settings_tab: SettingsTab,
+    system_fonts: Vec<SystemFont>,
+    font_filter: String,
     import_tab: ImportTab,
     // import buffers
     in_url: String,
@@ -1807,7 +2216,7 @@ fn thumb_worker_count() -> usize {
 }
 
 impl ScwollApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = channel();
         let (job_tx, job_rx) = channel::<Video>();
         let (source_tx, source_rx) = channel::<SourceFetchMsg>();
@@ -1836,9 +2245,15 @@ impl ScwollApp {
             });
         }
         drop(tx);
+        let logo_tex = cc.egui_ctx.load_texture(
+            "scwoll-logo",
+            logo_color_image(),
+            egui::TextureOptions::LINEAR,
+        );
         Self {
             videos: load_videos(),
             theme: load_theme(),
+            logo_tex,
             active_category: "All".into(),
             source: SourceFilter::All,
             search: String::new(),
@@ -1846,6 +2261,8 @@ impl ScwollApp {
             show_import: false,
             show_theme: false,
             settings_tab: SettingsTab::Appearance,
+            system_fonts: list_system_fonts(),
+            font_filter: String::new(),
             import_tab: ImportTab::Url,
             in_url: String::new(),
             in_url_cat: String::new(),
@@ -1880,6 +2297,18 @@ impl ScwollApp {
             thumb_cache: HashMap::new(),
             thumb_pending: HashSet::new(),
         }
+    }
+
+    fn finish_startup(self, ctx: &egui::Context) -> Self {
+        let selected = self
+            .system_fonts
+            .iter()
+            .find(|f| f.family == self.theme.font)
+            .cloned();
+        if let Err(e) = apply_ui_font(ctx, selected.as_ref()) {
+            eprintln!("[scwoll] font: {e}");
+        }
+        self
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -2291,6 +2720,12 @@ fn scan_folder(root: &Path, recursive: bool) -> Vec<PathBuf> {
 
 // --------------------------------------------------------------- eframe ----
 impl eframe::App for ScwollApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // The backdrop controls the window alpha, so keep the GL clear fully
+        // transparent. At 0% transparency the opaque backdrop still covers it.
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_visuals(ctx, &self.theme);
         paint_backdrop(ctx, &self.theme);
@@ -2319,9 +2754,12 @@ impl eframe::App for ScwollApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("▶").color(accent).size(24.0));
-                    ui.heading(egui::RichText::new("Scwoll").color(accent).strong());
-                    ui.label(egui::RichText::new("tube").color(muted).small());
+                    ui.add(
+                        egui::Image::from_texture(&self.logo_tex)
+                            .fit_to_exact_size(egui::vec2(30.0, 30.0))
+                            .rounding(egui::Rounding::same(7.0)),
+                    )
+                    .on_hover_text("Scwoll");
                     ui.add_space(10.0);
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
@@ -2329,14 +2767,18 @@ impl eframe::App for ScwollApp {
                             .desired_width(320.0),
                     );
                     let _ = resp;
-                    if ui.button("✕").on_hover_text("Clear search").clicked() {
+                    if ui
+                        .anim_button(egui::RichText::new("✖").color(muted).strong())
+                        .on_hover_text("Clear search")
+                        .clicked()
+                    {
                         self.search.clear();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⚙ Settings").on_hover_text("Appearance, glass and colour options").clicked() {
+                        if ui.anim_button("⚙ Settings").on_hover_text("Appearance, font, glass and colour options").clicked() {
                             self.show_theme = true;
                         }
-                        if ui.button("＋ Import").clicked() {
+                        if ui.anim_button("📥 Import").on_hover_text("Add videos from a URL, list or folder").clicked() {
                             self.show_import = true;
                         }
                     });
@@ -2364,7 +2806,7 @@ impl eframe::App for ScwollApp {
                         SourceFilter::Local => format!("🗂 {}", s.label()),
                         SourceFilter::Direct => format!("🔗 {}", s.label()),
                     };
-                    if ui.selectable_label(self.source == s && !self.showing_sources && self.active_source_id.is_none(), label).clicked() {
+                    if ui.anim_selectable_label(self.source == s && !self.showing_sources && self.active_source_id.is_none(), label).clicked() {
                         self.source = s;
                         self.selected = None;
                         self.active_source_id = None;
@@ -2372,32 +2814,32 @@ impl eframe::App for ScwollApp {
                     }
                 }
                 // Single entry point to the Sources page.
-                if ui.selectable_label(self.showing_sources || self.active_source_id.is_some(), format!("🌐 Sources ({})", self.sources.len())).on_hover_text("Saved web pages — rendered in-app").clicked() {
+                if ui.anim_selectable_label(self.showing_sources || self.active_source_id.is_some(), format!("🌐 Sources ({})", self.sources.len())).on_hover_text("Saved web pages — rendered in-app").clicked() {
                     self.open_sources_page();
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.heading("Categories");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("⚙ Manage").on_hover_text("Rename / move / clear categories").clicked() {
+                        if ui.anim_small_button("⚙ Manage").on_hover_text("Rename / move / clear categories").clicked() {
                             self.show_cats = true;
                         }
                     });
                 });
                 let cats = self.categories();
-                if ui.selectable_label(self.active_category == "All" && !self.showing_sources && self.active_source_id.is_none(), format!("All ({})", self.videos.len())).clicked() {
+                if ui.anim_selectable_label(self.active_category == "All" && !self.showing_sources && self.active_source_id.is_none(), format!("All ({})", self.videos.len())).clicked() {
                         self.active_category = "All".into();
                         self.active_source_id = None;
                         self.showing_sources = false;
                     }
                     let fav_n = self.videos.iter().filter(|x| x.favorite).count();
-                    if ui.selectable_label(self.active_category == "Favorites" && !self.showing_sources && self.active_source_id.is_none(), format!("★ Favorites ({fav_n})")).clicked() {
+                    if ui.anim_selectable_label(self.active_category == "Favorites" && !self.showing_sources && self.active_source_id.is_none(), format!("★ Favorites ({fav_n})")).clicked() {
                         self.active_category = "Favorites".into();
                         self.active_source_id = None;
                         self.showing_sources = false;
                     }
                     for (name, count) in &cats {
-                        if ui.selectable_label(self.active_category == *name && !self.showing_sources && self.active_source_id.is_none(), format!("{name} ({count})")).clicked() {
+                        if ui.anim_selectable_label(self.active_category == *name && !self.showing_sources && self.active_source_id.is_none(), format!("{name} ({count})")).clicked() {
                             self.active_category = name.clone();
                             self.active_source_id = None;
                             self.showing_sources = false;
@@ -2470,10 +2912,9 @@ impl eframe::App for ScwollApp {
 // ----------------------------------------------------------------- views --
 impl ScwollApp {
     fn show_grid(&mut self, ui: &mut egui::Ui, accent: egui::Color32, muted: egui::Color32) {
-        // Categories live in the sidebar — no duplicate category row here
-        // eating vertical space or stealing scroll.
         let list: Vec<Video> = self.filtered().into_iter().cloned().collect();
-        let all_cats: Vec<String> = self.categories().into_iter().map(|(n, _)| n).collect();
+        let cats = self.categories();
+        let all_cats: Vec<String> = cats.iter().map(|(n, _)| n.clone()).collect();
         ui.horizontal(|ui| {
             ui.heading(if self.active_category == "All" { self.source.label() } else { self.active_category.as_str() });
             ui.label(egui::RichText::new(format!("{} videos", list.len())).color(muted));
@@ -2488,7 +2929,7 @@ impl ScwollApp {
                 } else {
                     ui.heading("📼 Nothing here yet");
                     ui.label("Import a URL, a .txt list, or a folder of videos.");
-                    if ui.button("＋ Import videos").clicked() {
+                    if ui.anim_button("📥 Import videos").clicked() {
                         self.show_import = true;
                     }
                 }
@@ -2574,19 +3015,19 @@ impl ScwollApp {
                                     ui.label(egui::RichText::new(src).color(muted).small());
                                     ui.label(egui::RichText::new("\u{00b7}").color(muted).small());
                                     let cat_resp = ui.menu_button(
-                                        egui::RichText::new(format!("{} ▾", vid.category))
+                                        egui::RichText::new(format!("🏷 {} ▾", vid.category))
                                             .color(accent)
                                             .small()
                                             .strong(),
                                         |ui| {
                                             for c in &all_cats {
-                                                if ui.selectable_label(*c == vid.category, c.clone()).clicked() {
+                                                if ui.anim_selectable_label(*c == vid.category, c.clone()).clicked() {
                                                     new_cat = Some(c.clone());
                                                     ui.close_menu();
                                                 }
                                             }
                                             ui.separator();
-                                            if ui.selectable_label(false, "✎ Edit / new…").clicked() {
+                                            if ui.anim_selectable_label(false, "✎ Edit / new…").clicked() {
                                                 opened = true;
                                                 ui.close_menu();
                                             }
@@ -2595,7 +3036,7 @@ impl ScwollApp {
                                     cat_resp.response.on_hover_text("Change category");
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         let star = if vid.favorite { "★" } else { "☆" };
-                                        if ui.small_button(egui::RichText::new(star).color(if vid.favorite { accent } else { muted }))
+                                        if ui.anim_small_button(egui::RichText::new(star).color(if vid.favorite { accent } else { muted }))
                                             .on_hover_text(if vid.favorite { "Remove from Favorites" } else { "Add to Favorites" })
                                             .clicked()
                                         {
@@ -2622,25 +3063,42 @@ impl ScwollApp {
                                                     .rounding(img_rounding)
                                                     .sense(egui::Sense::click()),
                                             );
-                                            if img.hovered() {
+                                            let hover_t = ui.ctx().animate_bool_with_time(
+                                                img.id.with("thumb-play"),
+                                                img.hovered(),
+                                                0.16,
+                                            );
+                                            if hover_t > 0.001 {
                                                 let center = img.rect.center();
-                                                let r = (disp.y * 0.16).clamp(15.0, 26.0);
+                                                let base_r = (disp.y * 0.16).clamp(15.0, 26.0);
+                                                let r = base_r * (0.68 + 0.32 * hover_t);
                                                 ui.painter().circle_filled(
                                                     center,
                                                     r,
-                                                    egui::Color32::from_black_alpha(130),
+                                                    egui::Color32::from_black_alpha(
+                                                        (130.0 * hover_t) as u8,
+                                                    ),
                                                 );
                                                 ui.painter().circle_stroke(
                                                     center,
                                                     r,
-                                                    egui::Stroke::new(1.0_f32, alpha_color(egui::Color32::WHITE, 110)),
+                                                    egui::Stroke::new(
+                                                        1.0_f32,
+                                                        alpha_color(
+                                                            egui::Color32::WHITE,
+                                                            (110.0 * hover_t) as u8,
+                                                        ),
+                                                    ),
                                                 );
                                                 ui.painter().text(
                                                     center,
                                                     egui::Align2::CENTER_CENTER,
                                                     "▶",
                                                     egui::FontId::proportional(r * 0.9),
-                                                    egui::Color32::WHITE,
+                                                    alpha_color(
+                                                        egui::Color32::WHITE,
+                                                        (255.0 * hover_t) as u8,
+                                                    ),
                                                 );
                                             }
                                             img.clicked()
@@ -2657,7 +3115,7 @@ impl ScwollApp {
                                         .to_string();
                                     let tile = ui.add_sized(
                                         egui::vec2(content_w, slot_h),
-                                        egui::Button::new(
+                                        AnimatedButton::new(
                                             egui::RichText::new(letter)
                                                 .size(36.0)
                                                 .color(egui::Color32::WHITE),
@@ -2673,7 +3131,7 @@ impl ScwollApp {
                                                 tile.rect.center(),
                                                 egui::vec2(76.0, 26.0),
                                             ),
-                                            egui::Button::new("↻ Retry"),
+                                            AnimatedButton::new("↻ Retry"),
                                         );
                                         if retry.clicked() {
                                             self.retry_thumb(&vid);
@@ -2693,7 +3151,7 @@ impl ScwollApp {
                                     if ui
                                         .add_sized(
                                             egui::vec2(bw, 22.0),
-                                            egui::Button::new(
+                                            AnimatedButton::new(
                                                 egui::RichText::new("\u{25b6} Play")
                                                     .color(egui::Color32::WHITE),
                                             )
@@ -2704,13 +3162,13 @@ impl ScwollApp {
                                         play = true;
                                     }
                                     if ui
-                                        .add_sized(egui::vec2(bw, 22.0), egui::Button::new("Open"))
+                                        .add_sized(egui::vec2(bw, 22.0), AnimatedButton::new("Open"))
                                         .clicked()
                                     {
                                         opened = true;
                                     }
                                     if ui
-                                        .add_sized(egui::vec2(bw, 22.0), egui::Button::new("\u{1F5D1}"))
+                                        .add_sized(egui::vec2(bw, 22.0), AnimatedButton::new("\u{1F5D1}"))
                                         .on_hover_text("Delete")
                                         .clicked()
                                     {
@@ -2771,7 +3229,7 @@ impl ScwollApp {
     /// Sources home page: every saved source in one place. Add URLs
     /// (single or bulk list), open one to render it in-app.
     fn show_sources_list(&mut self, ui: &mut egui::Ui, accent: egui::Color32, muted: egui::Color32) {
-        if ui.button("← Back to library").clicked() {
+        if ui.anim_button("← Back to library").clicked() {
             self.showing_sources = false;
             return;
         }
@@ -2787,7 +3245,7 @@ impl ScwollApp {
                     .hint_text("Paste page URL(s) — lines, spaces or commas all work…")
                     .desired_width(f32::INFINITY),
             );
-            let commit = ui.button("＋ Add").clicked()
+            let commit = ui.anim_button("＋ Add").clicked()
                 || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
             if commit {
                 let raw = self.source_input.clone();
@@ -2824,14 +3282,14 @@ impl ScwollApp {
                             ui.label(egui::RichText::new(s.url.clone()).color(muted).small());
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("🗑").on_hover_text("Remove source").clicked() {
+                            if ui.anim_button("🗑").on_hover_text("Remove source").clicked() {
                                 self.remove_source(&s.id);
                                 self.toast("Source removed ✓");
                             }
-                            if ui.button("↗").on_hover_text("Open in system browser").clicked() {
+                            if ui.anim_button("↗").on_hover_text("Open in system browser").clicked() {
                                 open::that(&s.url).ok();
                             }
-                            if ui.add(egui::Button::new(egui::RichText::new("Open ➜").color(egui::Color32::WHITE)).fill(accent)).on_hover_text("Render this page inside the app").clicked() {
+                            if ui.add(AnimatedButton::new(egui::RichText::new("Open ➜").color(egui::Color32::WHITE)).fill(accent)).on_hover_text("Render this page inside the app").clicked() {
                                 self.showing_sources = false;
                                 self.active_source_id = Some(s.id.clone());
                                 self.selected = None;
@@ -2858,12 +3316,12 @@ impl ScwollApp {
             self.source_url_bar = surl.clone();
         }
         ui.horizontal(|ui| {
-            if ui.button("← Sources").clicked() {
+            if ui.anim_button("← Sources").clicked() {
                 self.active_source_id = None;
                 self.showing_sources = true;
                 return;
             }
-            if ui.button("← Library").clicked() {
+            if ui.anim_button("← Library").clicked() {
                 self.active_source_id = None;
                 self.showing_sources = false;
                 return;
@@ -2884,7 +3342,7 @@ impl ScwollApp {
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 go_now = true;
             }
-            if ui.button("Go ➜").clicked() {
+            if ui.anim_button("Go ➜").clicked() {
                 go_now = true;
             }
         });
@@ -2896,22 +3354,22 @@ impl ScwollApp {
             return;
         }
         ui.horizontal(|ui| {
-            if ui.button("↻ Refresh").clicked() {
+            if ui.anim_button("↻ Refresh").clicked() {
                 self.source_cache.remove(&sid);
                 self.source_loading.remove(&sid);
                 self.request_source(&sid, &surl);
             }
-            if ui.button("⚡ Load with JS").on_hover_text("Re-render via headless chromium (for script-rendered pages)").clicked() {
+            if ui.anim_button("⚡ Load with JS").on_hover_text("Re-render via headless chromium (for script-rendered pages)").clicked() {
                 self.request_source_js(&sid, &surl);
             }
-            if ui.button("↗ Browser").clicked() {
+            if ui.anim_button("↗ Browser").clicked() {
                 open::that(&surl).ok();
             }
-            if ui.button("⧉ Copy").clicked() {
+            if ui.anim_button("⧉ Copy").clicked() {
                 ctx.output_mut(|o| o.copied_text = surl.clone());
                 self.toast("URL copied ✓");
             }
-            if ui.button("🗑 Remove").clicked() {
+            if ui.anim_button("🗑 Remove").clicked() {
                 self.remove_source(&sid);
                 self.toast("Source removed ✓");
                 return;
@@ -2933,11 +3391,11 @@ impl ScwollApp {
         if let Some(err) = page.error {
             ui.label(egui::RichText::new(format!("⚠ Couldn't load page: {err}")).color(egui::Color32::from_rgb(220, 120, 120)));
             ui.horizontal(|ui| {
-                if ui.button("↻ Retry").clicked() {
+                if ui.anim_button("↻ Retry").clicked() {
                     self.source_cache.remove(&sid);
                     self.request_source(&sid, &surl);
                 }
-                if ui.button("↗ Open in browser instead").clicked() {
+                if ui.anim_button("↗ Open in browser instead").clicked() {
                     open::that(&surl).ok();
                 }
             });
@@ -2955,7 +3413,7 @@ impl ScwollApp {
         if !vids.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("🎬 {} video(s) on this page", vids.len())).color(accent).strong());
-                if ui.small_button("＋ Import all").clicked() {
+                if ui.anim_small_button("📥 Import all").clicked() {
                     let cat = if self.active_category != "All" && self.active_category != "Favorites" {
                         self.active_category.clone()
                     } else {
@@ -2984,7 +3442,7 @@ impl ScwollApp {
                             ui.horizontal(|ui| {
                                 if self.videos.iter().any(|x| x.url == l.url) {
                                     ui.label(egui::RichText::new("in library ✓").color(muted).small());
-                                } else if ui.small_button("＋ Import").clicked() {
+                                } else if ui.anim_small_button("📥 Import").clicked() {
                                     let cat = if self.active_category != "All" && self.active_category != "Favorites" {
                                         self.active_category.clone()
                                     } else {
@@ -2995,7 +3453,7 @@ impl ScwollApp {
                                         Err(e) => self.toast(e),
                                     }
                                 }
-                                if ui.small_button("▶ Play").clicked() {
+                                if ui.anim_small_button("▶ Play").clicked() {
                                     let v = make_video_from_url(&l.url, "General".into());
                                     self.player.play(&v);
                                     self.toast(format!("Playing: {}", l.label));
@@ -3133,7 +3591,7 @@ impl ScwollApp {
             self.selected = None;
             return;
         };
-        if ui.button("← Back to library").clicked() {
+        if ui.anim_button("← Back to library").clicked() {
             self.selected = None;
         }
         ui.add_space(6.0);
@@ -3194,7 +3652,7 @@ impl ScwollApp {
                 ui.label(egui::RichText::new(v.title.clone()).color(egui::Color32::WHITE).strong());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(if playing { "⏸ Stop" } else { "▶ Play in mpv" }).clicked() {
+                    if ui.anim_button(if playing { "⏸ Stop" } else { "▶ Play in mpv" }).clicked() {
                         if playing {
                             self.player.stop();
                             self.player.status = "Stopped.".into();
@@ -3202,7 +3660,7 @@ impl ScwollApp {
                             self.player.play(&v);
                         }
                     }
-                    if ui.button("↗ Reveal / copy URL").clicked() {
+                    if ui.anim_button("↗ Reveal / copy URL").clicked() {
                         if v.kind == VideoKind::Local {
                             if let Some(p) = v.file_path.clone() {
                                 open::that(Path::new(&p).parent().map(|x| x.to_path_buf()).unwrap_or(PathBuf::from(&p))).ok();
@@ -3234,12 +3692,12 @@ impl ScwollApp {
                 .selected_text("Pick…")
                 .show_ui(ui, |ui| {
                     for c in &cats {
-                        if ui.selectable_label(self.edit_cat == *c, c.clone()).clicked() {
+                        if ui.anim_selectable_label(self.edit_cat == *c, c.clone()).clicked() {
                             self.edit_cat = c.clone();
                         }
                     }
                 });
-            if ui.button("Save").clicked() {
+            if ui.anim_button("Save").clicked() {
                 if let Some(slot) = self.videos.iter_mut().find(|x| x.id == v.id) {
                     if !self.edit_title.trim().is_empty() {
                         slot.title = self.edit_title.trim().to_string();
@@ -3250,13 +3708,13 @@ impl ScwollApp {
                 self.persist();
                 self.toast("Saved ✓");
             }
-            if ui.button(if v.favorite { "★ Favorited" } else { "☆ Favorite" }).clicked() {
+            if ui.anim_button(if v.favorite { "★ Favorited" } else { "☆ Favorite" }).clicked() {
                 if let Some(slot) = self.videos.iter_mut().find(|x| x.id == v.id) {
                     slot.favorite = !slot.favorite;
                 }
                 self.persist();
             }
-            if ui.button("🗑 Delete").clicked() {
+            if ui.anim_button("🗑 Delete").clicked() {
                 let title = v.title.clone();
                 let vid_id = v.id.clone();
                 self.delete_video(&vid_id);
@@ -3275,7 +3733,7 @@ impl ScwollApp {
                         ui.set_min_width(200.0);
                         ui.label(egui::RichText::new(x.title.clone()).strong());
                         ui.small(x.category.clone());
-                        if ui.small_button("Open").clicked() {
+                        if ui.anim_small_button("Open").clicked() {
                             self.selected = Some(x.id.clone());
                             self.edit_title = x.title.clone();
                             self.edit_cat = x.category.clone();
@@ -3289,16 +3747,16 @@ impl ScwollApp {
     // ------------------------------------------------------------ windows --
     fn import_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_import;
-        egui::Window::new("＋ Import videos")
+        egui::Window::new("📥 Import videos")
             .open(&mut open)
             .resizable(true)
             .default_width(480.0)
             .max_height(560.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.import_tab, ImportTab::Url, "Single URL");
-                    ui.selectable_value(&mut self.import_tab, ImportTab::List, "List / .txt");
-                    ui.selectable_value(&mut self.import_tab, ImportTab::Folder, "Folder");
+                    ui.anim_selectable_value(&mut self.import_tab, ImportTab::Url, "Single URL");
+                    ui.anim_selectable_value(&mut self.import_tab, ImportTab::List, "List / .txt");
+                    ui.anim_selectable_value(&mut self.import_tab, ImportTab::Folder, "Folder");
                 });
                 ui.separator();
                 match self.import_tab {
@@ -3311,7 +3769,7 @@ impl ScwollApp {
                         });
                         ui.label("Title override (optional):");
                         ui.add(egui::TextEdit::singleline(&mut self.in_url_title).hint_text("blank = auto").desired_width(f32::INFINITY));
-                        if ui.button("Add video").clicked() {
+                        if ui.anim_button("Add video").clicked() {
                             match self.import_url(&self.in_url.clone(), &self.in_url_cat.clone(), &self.in_url_title.clone()) {
                                 Ok(()) => {
                                     self.toast("Added ✓");
@@ -3362,7 +3820,7 @@ impl ScwollApp {
                         ui.horizontal(|ui| {
                             ui.label("Category:");
                             ui.add(egui::TextEdit::singleline(&mut self.in_bulk_cat).hint_text("General").desired_width(140.0));
-                            if ui.button("📄 Choose .txt…").clicked() {
+                            if ui.anim_button("📄 Choose .txt…").clicked() {
                                 if let Some(path) = rfd::FileDialog::new().add_filter("text", &["txt", "m3u", "m3u8", "csv"]).pick_file() {
                                     if let Ok(content) = std::fs::read_to_string(&path) {
                                         if !self.in_bulk.is_empty() {
@@ -3375,7 +3833,7 @@ impl ScwollApp {
                                 }
                             }
                         });
-                        if ui.button("Import list").clicked() {
+                        if ui.anim_button("Import list").clicked() {
                             let (a, s) = self.import_bulk(&self.in_bulk.clone(), &self.in_bulk_cat.clone());
                             self.toast(format!("Imported {a}, skipped {s}."));
                             self.in_bulk.clear();
@@ -3385,7 +3843,7 @@ impl ScwollApp {
                         ui.label("Scan a folder containing video files:");
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.in_folder).hint_text("/home/you/Videos").desired_width(320.0));
-                            if ui.button("📁 Browse…").clicked() {
+                            if ui.anim_button("📁 Browse…").clicked() {
                                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                                     self.in_folder = dir.to_string_lossy().to_string();
                                 }
@@ -3396,7 +3854,7 @@ impl ScwollApp {
                             ui.add(egui::TextEdit::singleline(&mut self.in_folder_cat).hint_text("Movies").desired_width(140.0));
                             ui.checkbox(&mut self.in_recursive, "Subfolders");
                         });
-                        if ui.button("Scan folder").clicked() {
+                        if ui.anim_button("Scan folder").clicked() {
                             match self.import_folder(&self.in_folder.clone(), &self.in_folder_cat.clone(), self.in_recursive) {
                                 Ok(n) => self.toast(format!("Added {n} videos ✓")),
                                 Err(e) => self.toast(e),
@@ -3412,16 +3870,19 @@ impl ScwollApp {
         let mut open = self.show_theme;
         let mut changed = false;
         let mut preset_msg: Option<String> = None;
+        let mut font_job: Option<Option<SystemFont>> = None;
+        let previous_font = self.theme.font.clone();
         egui::Window::new("⚙ Settings")
             .open(&mut open)
             .resizable(true)
             .default_width(465.0)
             .max_height(650.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "✨ Appearance");
-                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Glass, "🧊 Glass & motion");
-                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Colors, "🎨 Colors");
+                ui.horizontal_wrapped(|ui| {
+                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "✨ Appearance");
+                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Font, "🔤 Font");
+                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Glass, "🧊 Glass & motion");
+                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Colors, "🎨 Colors");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical()
@@ -3430,10 +3891,22 @@ impl ScwollApp {
                     .show(ui, |ui| {
                         match self.settings_tab {
                             SettingsTab::Appearance => {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("UI font").strong());
+                                    ui.label(if self.theme.font.trim().is_empty() {
+                                        "Default (bundled)".to_owned()
+                                    } else {
+                                        self.theme.font.clone()
+                                    });
+                                    if ui.anim_small_button("Change…").clicked() {
+                                        self.settings_tab = SettingsTab::Font;
+                                    }
+                                });
+                                ui.separator();
                                 ui.label(egui::RichText::new("Presets").strong());
                                 ui.horizontal_wrapped(|ui| {
                                     for name in ["Liquid Glass", "Frosted", "Neon", "OLED", "Minimal"] {
-                                        if ui.button(name).clicked() {
+                                        if ui.anim_button(name).clicked() {
                                             apply_theme_preset(&mut self.theme, name);
                                             preset_msg = Some(name.to_string());
                                             changed = true;
@@ -3507,8 +3980,155 @@ impl ScwollApp {
                                     .small(),
                                 );
                             }
+                            SettingsTab::Font => {
+                                ui.label(egui::RichText::new("UI font").strong());
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Pick any font installed on your system. Missing glyphs and emoji still fall back to Scwoll's bundled fonts.",
+                                    )
+                                    .color(muted)
+                                    .small(),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Filter:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.font_filter)
+                                            .hint_text("Search installed fonts…")
+                                            .desired_width(235.0),
+                                    );
+                                    if ui.anim_small_button("✖").on_hover_text("Clear filter").clicked() {
+                                        self.font_filter.clear();
+                                    }
+                                    if ui
+                                        .anim_small_button("↻")
+                                        .on_hover_text("Rescan installed fonts")
+                                        .clicked()
+                                    {
+                                        self.system_fonts = list_system_fonts();
+                                        preset_msg = Some(format!(
+                                            "Found {} system font families",
+                                            self.system_fonts.len()
+                                        ));
+                                    }
+                                });
+                                ui.add_space(4.0);
+
+                                let selected_text = if self.theme.font.trim().is_empty() {
+                                    "Default (bundled)".to_owned()
+                                } else {
+                                    self.theme.font.clone()
+                                };
+                                let mut picked: Option<Option<SystemFont>> = None;
+                                egui::ComboBox::from_id_source("ui-font-picker")
+                                    .selected_text(selected_text)
+                                    .width(300.0)
+                                    .show_ui(ui, |ui| {
+                                        egui::ScrollArea::vertical()
+                                            .max_height(300.0)
+                                            .auto_shrink([false, true])
+                                            .show(ui, |ui| {
+                                                if ui
+                                                    .anim_selectable_label(
+                                                        self.theme.font.trim().is_empty(),
+                                                        "Default (bundled)",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    picked = Some(None);
+                                                    ui.close_menu();
+                                                }
+                                                let needle = self.font_filter.trim().to_ascii_lowercase();
+                                                for font in &self.system_fonts {
+                                                    if !needle.is_empty()
+                                                        && !font
+                                                            .family
+                                                            .to_ascii_lowercase()
+                                                            .contains(&needle)
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if ui
+                                                        .anim_selectable_label(
+                                                            self.theme.font == font.family,
+                                                            &font.family,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        picked = Some(Some(font.clone()));
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                    });
+                                if let Some(pick) = picked {
+                                    self.theme.font = pick
+                                        .as_ref()
+                                        .map(|f| f.family.clone())
+                                        .unwrap_or_default();
+                                    font_job = Some(pick);
+                                    changed = true;
+                                }
+
+                                if self.system_fonts.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No system fonts found — is fontconfig (fc-list) installed?",
+                                        )
+                                        .color(muted)
+                                        .small(),
+                                    );
+                                } else if !self.theme.font.trim().is_empty()
+                                    && !self
+                                        .system_fonts
+                                        .iter()
+                                        .any(|f| f.family == self.theme.font)
+                                {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "That font is not installed anymore — using the bundled fallback.",
+                                        )
+                                        .color(muted)
+                                        .small(),
+                                    );
+                                }
+                                if let Some(font) = self
+                                    .system_fonts
+                                    .iter()
+                                    .find(|f| f.family == self.theme.font)
+                                {
+                                    ui.label(
+                                        egui::RichText::new(format!("File: {}", font.path.display()))
+                                            .color(muted)
+                                            .small(),
+                                    );
+                                }
+
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.label(egui::RichText::new("Preview").strong());
+                                ui.label(
+                                    egui::RichText::new(
+                                        "The quick brown fox jumps over the lazy dog\n0123456789  ·  Scwoll  ·  Aa Bb Cc",
+                                    )
+                                    .size(17.0),
+                                );
+                            }
                             SettingsTab::Glass => {
                                 ui.label(egui::RichText::new("Glass & backdrop").strong());
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.theme.background_transparency, 0..=100)
+                                            .text("Background transparency")
+                                            .suffix("%"),
+                                    )
+                                    .on_hover_text(
+                                        "0% keeps the backdrop opaque; 100% lets the desktop show through. Requires a compositing window manager.",
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
                                 if ui
                                     .add(
                                         egui::Slider::new(&mut self.theme.blur, 0..=40)
@@ -3612,7 +4232,7 @@ impl ScwollApp {
                                 }
                                 ui.add_space(4.0);
                                 ui.horizontal(|ui| {
-                                    if ui.button("⇄ Swap accents").clicked() {
+                                    if ui.anim_button("⇄ Swap accents").clicked() {
                                         std::mem::swap(&mut self.theme.accent, &mut self.theme.accent2);
                                         changed = true;
                                     }
@@ -3623,12 +4243,13 @@ impl ScwollApp {
                     });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Reset defaults").clicked() {
+                    if ui.anim_button("Reset defaults").clicked() {
                         self.theme = Theme::default();
+                        font_job = Some(None);
                         changed = true;
                         preset_msg = Some("Defaults restored".into());
                     }
-                    if ui.button("💾 Save").clicked() {
+                    if ui.anim_button("💾 Save").clicked() {
                         save_theme(&self.theme);
                         preset_msg = Some("Settings saved".into());
                     }
@@ -3638,7 +4259,20 @@ impl ScwollApp {
                 });
             });
         self.show_theme = open;
-        if changed {
+        if let Some(job) = font_job {
+            match apply_ui_font(ctx, job.as_ref()) {
+                Ok(()) => {
+                    if changed {
+                        save_theme(&self.theme);
+                    }
+                }
+                Err(e) => {
+                    self.theme.font = previous_font;
+                    save_theme(&self.theme);
+                    self.toast(format!("Font error: {e}"));
+                }
+            }
+        } else if changed {
             save_theme(&self.theme);
         }
         if let Some(msg) = preset_msg {
@@ -3670,10 +4304,10 @@ impl ScwollApp {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("{name} ({count})")).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("🗑 Clear").on_hover_text("Move these videos to General").clicked() {
+                            if ui.anim_small_button("🗑 Clear").on_hover_text("Move these videos to General").clicked() {
                                 clear_job = Some(name.clone());
                             }
-                            if ui.small_button("✎ Rename").clicked() {
+                            if ui.anim_small_button("✎ Rename").clicked() {
                                 let buf = self.cat_edit_buf.get(name).cloned().unwrap_or_else(|| name.clone());
                                 rename_job = Some((name.clone(), buf));
                             }
@@ -3709,13 +4343,14 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_transparent(true),
+            .with_transparent(true)
+            .with_icon(logo_icon_data()),
         ..Default::default()
     };
     eframe::run_native(
         "Scwoll — media player",
         opts,
-        Box::new(|cc| Ok(Box::new(ScwollApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(ScwollApp::new(cc).finish_startup(&cc.egui_ctx)))),
     )
 }
 

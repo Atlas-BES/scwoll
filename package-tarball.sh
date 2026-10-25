@@ -12,7 +12,7 @@
 #     scwoll            release binary
 #     README.md
 #     sample_urls.txt
-#     scwoll.png        app icon
+#     scwoll.png        app icon (from project logo.png)
 #
 # Notes:
 #   - Build runs inside nix-shell when cargo isn't on PATH (needed on NixOS
@@ -69,7 +69,10 @@ mkdir -p "$STAGE"
 cp "$BIN" "$STAGE/${NAME}"
 [[ -f README.md ]]       && cp README.md "$STAGE/"
 [[ -f sample_urls.txt ]] && cp sample_urls.txt "$STAGE/"
-[[ -f assets/scwoll.png ]] && cp assets/scwoll.png "$STAGE/"
+ICON_SRC=""
+[[ -f logo.png ]] && ICON_SRC="logo.png"
+[[ -z "$ICON_SRC" && -f assets/scwoll.png ]] && ICON_SRC="assets/scwoll.png"
+[[ -n "$ICON_SRC" ]] && cp "$ICON_SRC" "$STAGE/scwoll.png"
 chmod +x "$STAGE/${NAME}"
 
 mkdir -p "$OUTPUT_DIR"

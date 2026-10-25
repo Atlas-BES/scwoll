@@ -74,9 +74,10 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 fi
 [[ -x "$BIN" ]] || { echo "error: $BIN not found (build it first or drop --skip-build)" >&2; exit 1; }
 
-# ---- icon: prefer checked-in PNG, else SVG, else draw a fallback ----
+# ---- icon: project logo.png first, then legacy asset, then SVG ----
 ICON_SRC=""
-[[ -f assets/scwoll.png ]] && ICON_SRC="assets/scwoll.png"
+[[ -f logo.png ]] && ICON_SRC="logo.png"
+[[ -z "$ICON_SRC" && -f assets/scwoll.png ]] && ICON_SRC="assets/scwoll.png"
 [[ -z "$ICON_SRC" && -f assets/scwoll.svg ]] && ICON_SRC="assets/scwoll.svg"
 
 # ---- stage AppDir ----
@@ -101,7 +102,13 @@ if [[ -n "$ICON_SRC" ]]; then
       echo "warning: no SVG converter found; AppDir will have no icon" >&2
     fi
   else
-    cp "$ICON_SRC" "$APPDIR/scwoll.png"
+    if command -v magick >/dev/null 2>&1; then
+      magick "$ICON_SRC" -resize 256x256 "$APPDIR/scwoll.png"
+    elif command -v convert >/dev/null 2>&1; then
+      convert "$ICON_SRC" -resize 256x256 "$APPDIR/scwoll.png"
+    else
+      cp "$ICON_SRC" "$APPDIR/scwoll.png"
+    fi
   fi
 fi
 # Ultimate fallback: paint a minimal play-button PNG with ImageMagick.

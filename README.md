@@ -18,14 +18,19 @@
   then pure-`mpv` percent-seeks (works anywhere `mpv` exists, incl. YouTube
   links). Cached in `data/thumbs/`; last resort is a letter tile
 - **Themes & visual effects** (`⚙ Settings`)
+  - **System font picker** (`🔤 Font`) — search and apply any font family
+    installed via fontconfig; missing glyphs/emoji fall back to the bundled
+    fonts and the choice is saved in `data/theme.json`
   - **Presets** — ✨ Liquid Glass, Frosted, Neon, OLED, Minimal
   - **Liquid glass** toggle with panel opacity, corner radius, card size,
     shadow/depth and accent glow
-  - **Frost / blur** slider (simulated translucent frosting), animated
+  - **Frost / blur** slider (simulated translucent frosting), **background
+    transparency** (default 5%, lets the desktop show through), animated
     **aurora background** with intensity + motion toggle, film grain and
     vignette
   - Hover rim-light on cards, accent gradient panel edges, glass cards and
-    rounded thumbnails with a play overlay
+    rounded thumbnails with a play overlay; all buttons animate their fill,
+    border, glow and expansion on hover
   - Fully customizable colors: accent, accent 2 / aurora, background,
     cards/windows, inputs, text, muted text and sidebar. Saved to
     `data/theme.json`

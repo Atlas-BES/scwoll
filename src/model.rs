@@ -66,6 +66,9 @@ pub struct Theme {
     /// Panel opacity in percent (20-100). Ignored when `glass` is off.
     #[serde(default = "default_opacity")]
     pub opacity: u8,
+    /// Window/backdrop transparency in percent (0 = opaque, 100 = fully transparent).
+    #[serde(default = "default_background_transparency")]
+    pub background_transparency: u8,
     /// Drop-shadow strength (0-100).
     #[serde(default = "default_shadow")]
     pub shadow: u8,
@@ -95,6 +98,9 @@ pub struct Theme {
     pub accent2: String,
     #[serde(default = "default_card_scale")]
     pub card_scale: f32,
+    /// UI font family chosen from the system (fontconfig). Empty = egui's bundled fonts.
+    #[serde(default)]
+    pub font: String,
 }
 
 fn default_style() -> String {
@@ -132,6 +138,9 @@ fn default_blur() -> u8 {
 }
 fn default_opacity() -> u8 {
     72
+}
+fn default_background_transparency() -> u8 {
+    5
 }
 fn default_shadow() -> u8 {
     55
@@ -179,6 +188,7 @@ impl Default for Theme {
             glass: default_glass(),
             blur: default_blur(),
             opacity: default_opacity(),
+            background_transparency: default_background_transparency(),
             shadow: default_shadow(),
             glow: default_glow(),
             ambient: default_ambient(),
@@ -189,6 +199,7 @@ impl Default for Theme {
             hover_glow: default_hover_glow(),
             accent2: c_accent2(),
             card_scale: default_card_scale(),
+            font: String::new(),
         }
     }
 }
