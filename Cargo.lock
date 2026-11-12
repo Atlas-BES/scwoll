@@ -3001,6 +3001,7 @@ dependencies = [
  "egui",
  "image",
  "open",
+ "raw-window-handle 0.6.2",
  "rfd",
  "serde",
  "serde_json",
@@ -3008,6 +3009,11 @@ dependencies = [
  "url",
  "uuid",
  "wait-timeout",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols 0.32.13",
+ "wayland-protocols-plasma",
+ "x11rb",
 ]
 
 [[package]]

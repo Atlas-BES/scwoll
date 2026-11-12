@@ -5,3 +5,5 @@
 *.AppImage.*
 Scwoll.AppDir/
 scwoll-*/
+/result
+.direnv/

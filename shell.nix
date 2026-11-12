@@ -1,3 +1,5 @@
+# Legacy nix-shell entry point (used by run.sh / run-x11.sh).
+# Preferred: `nix develop` (see flake.nix / nix/devshell.nix).
 { pkgs ? import <nixpkgs> {} }:
 let
   guiLibs = with pkgs; [

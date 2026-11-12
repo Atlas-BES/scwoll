@@ -3,6 +3,7 @@
 //! Playback is handled by mpv (must be installed), controlled from this UI.
 
 mod model;
+mod system_blur;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1251,6 +1252,46 @@ fn theme_shadow(theme: &Theme) -> egui::Shadow {
     }
 }
 
+fn settings_popup_id() -> egui::Id {
+    egui::Id::new("scwoll-settings-popup")
+}
+
+fn import_popup_id() -> egui::Id {
+    egui::Id::new("scwoll-import-popup")
+}
+
+/// Toggle a top-bar dropdown, closing any other open popup first.
+fn toggle_dropdown(ui: &egui::Ui, id: egui::Id) {
+    let was_open = ui.memory(|m| m.is_popup_open(id));
+    ui.memory_mut(|m| m.close_popup());
+    if !was_open {
+        ui.memory_mut(|m| m.open_popup(id));
+    }
+}
+
+/// Top-bar dropdowns are plain extensions of the toolbar: same solid colour,
+/// square corners, no border and no shadow.
+fn style_popup(ui: &mut egui::Ui, theme: &Theme) {
+    let fill = hex_to_color(&theme.surface);
+    let style = ui.style_mut();
+    style.visuals.window_fill = fill;
+    style.visuals.window_stroke = egui::Stroke::NONE;
+    style.visuals.window_rounding = egui::Rounding::ZERO;
+    style.visuals.menu_rounding = egui::Rounding::ZERO;
+    style.visuals.popup_shadow = egui::Shadow::NONE;
+    style.visuals.window_shadow = egui::Shadow::NONE;
+    style.spacing.menu_margin = egui::Margin::symmetric(14.0, 8.0);
+}
+
+/// Shift a toolbar button's popup anchor down so the dropdown starts at the
+/// bottom edge of the whole top panel instead of at the button's own bottom.
+fn anchor_below_top_bar(response: &egui::Response, top_bar_bottom: f32) -> egui::Response {
+    let mut anchor = response.clone();
+    anchor.rect.max.y = top_bar_bottom;
+    anchor.interact_rect.max.y = top_bar_bottom.max(anchor.interact_rect.min.y);
+    anchor
+}
+
 /// Curated looks. Presets only touch appearance/effect fields so users keep
 /// their accent and category data. The Colors tab is still fully editable.
 pub fn apply_theme_preset(theme: &mut Theme, preset: &str) {
@@ -1386,10 +1427,49 @@ fn paint_radial_glow(
     painter.add(egui::Shape::mesh(mesh));
 }
 
+/// Center-crop UV rectangle so a background image covers the window without
+/// stretching.
+fn cover_uv(image_size: [usize; 2], target: egui::Vec2) -> egui::Rect {
+    let iw = image_size[0].max(1) as f32;
+    let ih = image_size[1].max(1) as f32;
+    let target_aspect = (target.x / target.y.max(1.0)).max(0.01);
+    let image_aspect = iw / ih;
+    if image_aspect > target_aspect {
+        let visible = (target_aspect / image_aspect).clamp(0.0, 1.0);
+        let x = (1.0 - visible) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(x, 0.0), egui::pos2(1.0 - x, 1.0))
+    } else {
+        let visible = (image_aspect / target_aspect).clamp(0.0, 1.0);
+        let y = (1.0 - visible) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(0.0, y), egui::pos2(1.0, 1.0 - y))
+    }
+}
+
+fn load_background_texture(
+    ctx: &egui::Context,
+    path: &str,
+) -> Result<egui::TextureHandle, String> {
+    let img = image::open(path).map_err(|e| format!("Could not open {path}: {e}"))?;
+    let img = if img.width() > 2560 || img.height() > 2560 {
+        img.thumbnail(2560, 2560)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    Ok(ctx.load_texture("scwoll-background", color, egui::TextureOptions::LINEAR))
+}
+
 /// Full-window backdrop: a subdued accent gradient, soft animated aurora
 /// blobs, a vignette and optional film grain. Painted on egui's background
 /// layer so every translucent glass panel picks up the colour behind it.
-fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
+fn paint_backdrop(
+    ctx: &egui::Context,
+    theme: &Theme,
+    bg_tex: Option<&egui::TextureHandle>,
+    system_blur_active: bool,
+) {
     let rect = ctx.screen_rect();
     if rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -1400,17 +1480,42 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
     let accent2 = hex_to_color(&theme.accent2);
     let ambient = (theme.ambient as f32 / 100.0).clamp(0.0, 1.0);
     let bg_opacity = 1.0 - theme.background_transparency.min(100) as f32 / 100.0;
-    let bg_alpha = (bg_opacity * 255.0).round() as u8;
+    let has_image = bg_tex.is_some();
+    let image_dim = (theme.background_image_dim.min(100) as f32 / 100.0).clamp(0.0, 1.0);
+    // Native compositor blur sits behind the window. Fade Scwoll's own
+    // backdrop by the intensity amount so the real blur becomes visible.
+    let blur_reveal = if theme.system_blur && system_blur_active {
+        (theme.system_blur_intensity.min(100) as f32 / 100.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let keep = 1.0 - blur_reveal;
+    let effect_opacity = (if has_image { 1.0 - image_dim } else { bg_opacity }) * keep;
+    let overlay_alpha = (if has_image {
+        image_dim * 255.0
+    } else {
+        bg_opacity * 255.0
+    } * keep)
+        .round() as u8;
+
+    if let Some(tex) = bg_tex {
+        painter.image(
+            tex.id(),
+            rect,
+            cover_uv(tex.size(), rect.size()),
+            egui::Color32::from_white_alpha((keep * 255.0).round() as u8),
+        );
+    }
 
     // Base gradient: a touch of both accents at opposite corners keeps the
     // background from looking like a flat slab even with aurora disabled.
     // The alpha comes from the transparency setting so the desktop can show
     // through when the window's compositor supports it.
     let tint = if theme.aurora { 0.12 } else { 0.05 };
-    let tl = alpha_color(mix_color(bg, accent, tint * ambient), bg_alpha);
-    let tr = alpha_color(mix_color(bg, accent2, tint * ambient * 0.85), bg_alpha);
-    let bl = alpha_color(mix_color(bg, accent2, tint * ambient * 0.65), bg_alpha);
-    let br = alpha_color(mix_color(bg, accent, tint * ambient * 0.75), bg_alpha);
+    let tl = alpha_color(mix_color(bg, accent, tint * ambient), overlay_alpha);
+    let tr = alpha_color(mix_color(bg, accent2, tint * ambient * 0.85), overlay_alpha);
+    let bl = alpha_color(mix_color(bg, accent2, tint * ambient * 0.65), overlay_alpha);
+    let br = alpha_color(mix_color(bg, accent, tint * ambient * 0.75), overlay_alpha);
     let mut base = egui::Mesh::default();
     base.colored_vertex(rect.left_top(), tl);
     base.colored_vertex(rect.right_top(), tr);
@@ -1420,7 +1525,7 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
     base.add_triangle(2, 1, 3);
     painter.add(egui::Shape::mesh(base));
 
-    if theme.aurora && ambient > 0.01 && bg_opacity > 0.0 {
+    if theme.aurora && ambient > 0.01 && effect_opacity > 0.0 {
         let t = if theme.animate {
             ctx.input(|i| i.time) as f32
         } else {
@@ -1430,7 +1535,7 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
         let frost = (0.70 + theme.blur as f32 / 50.0).clamp(0.65, 1.9);
         let strength = (((12.0 + ambient * 38.0) * (0.72 + theme.glow as f32 / 140.0))
             .clamp(8.0, 86.0)
-            * bg_opacity) as u8;
+            * effect_opacity) as u8;
         let blobs = [
             (0.16, 0.24, accent, 0.50, 0.0, 0.10, 0.055),
             (0.82, 0.18, accent2, 0.46, 1.9, 0.085, 0.075),
@@ -1450,7 +1555,7 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
         }
     }
 
-    if theme.vignette > 0 && bg_opacity > 0.0 {
+    if theme.vignette > 0 && effect_opacity > 0.0 {
         let v = theme.vignette as f32 / 100.0;
         let radius = rect.width().max(rect.height()) * 0.78;
         paint_radial_glow(
@@ -1458,15 +1563,15 @@ fn paint_backdrop(ctx: &egui::Context, theme: &Theme) {
             rect.center(),
             radius,
             alpha_color(egui::Color32::BLACK, 0),
-            egui::Color32::from_black_alpha((v * 125.0 * bg_opacity) as u8),
+            egui::Color32::from_black_alpha((v * 125.0 * effect_opacity) as u8),
         );
     }
 
-    if theme.grain > 0 && bg_opacity > 0.0 {
+    if theme.grain > 0 && effect_opacity > 0.0 {
         let amount = theme.grain as f32 / 100.0;
         let count = ((rect.width() * rect.height() / 500.0) * amount) as usize;
         let count = count.clamp(0, 5000);
-        let a = ((5.0 + amount * 30.0) * bg_opacity) as u8;
+        let a = ((5.0 + amount * 30.0) * effect_opacity) as u8;
         let mut grain = egui::Mesh::default();
         for i in 0..count {
             let h = hash32(i as u32 ^ 0x9e37_79b9);
@@ -1544,6 +1649,24 @@ fn shorten_title(title: &str, content_w: f32) -> String {
         title.to_string()
     } else {
         chars[..max].iter().collect::<String>() + "\u{2026}"
+    }
+}
+
+/// Compact "3d ago" style label for the YouTube-style card metadata.
+fn relative_age(iso: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(iso) else {
+        return "recently".into();
+    };
+    let secs = (chrono::Utc::now() - then.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0);
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        86_400..=2_591_999 => format!("{}d ago", secs / 86_400),
+        2_592_000..=31_535_999 => format!("{}mo ago", secs / 2_592_000),
+        _ => format!("{}y ago", secs / 31_536_000),
     }
 }
 
@@ -2136,16 +2259,74 @@ enum SettingsTab {
     Colors,
 }
 
+#[derive(Default)]
+struct CardAction {
+    open: bool,
+    play: bool,
+    delete: bool,
+    favorite: bool,
+    new_cat: Option<String>,
+}
+
+/// Right-click menu for a YouTube-style video card.
+fn youtube_card_menu(
+    ui: &mut egui::Ui,
+    vid: &Video,
+    all_cats: &[String],
+    act: &mut CardAction,
+) {
+    if ui.anim_selectable_label(false, "▶ Play").clicked() {
+        act.play = true;
+        ui.close_menu();
+    }
+    if ui.anim_selectable_label(false, "Open details").clicked() {
+        act.open = true;
+        ui.close_menu();
+    }
+    let fav = if vid.favorite {
+        "★ Remove from Favorites"
+    } else {
+        "☆ Add to Favorites"
+    };
+    if ui.anim_selectable_label(false, fav).clicked() {
+        act.favorite = true;
+        ui.close_menu();
+    }
+    ui.separator();
+    ui.menu_button("🏷 Change category", |ui| {
+        for c in all_cats {
+            if ui
+                .anim_selectable_label(*c == vid.category, c.clone())
+                .clicked()
+            {
+                act.new_cat = Some(c.clone());
+                ui.close_menu();
+            }
+        }
+        ui.separator();
+        if ui.anim_selectable_label(false, "✎ Edit / new…").clicked() {
+            act.open = true;
+            ui.close_menu();
+        }
+    });
+    ui.separator();
+    if ui.anim_selectable_label(false, "🗑 Delete").clicked() {
+        act.delete = true;
+        ui.close_menu();
+    }
+}
+
 struct ScwollApp {
     videos: Vec<Video>,
     theme: Theme,
+    system_blur: system_blur::SystemBlur,
+    top_bar_bottom: f32,
     logo_tex: egui::TextureHandle,
+    bg_tex: Option<egui::TextureHandle>,
     active_category: String,
     source: SourceFilter,
     search: String,
     selected: Option<String>,
-    show_import: bool,
-    show_theme: bool,
     settings_tab: SettingsTab,
     system_fonts: Vec<SystemFont>,
     font_filter: String,
@@ -2253,13 +2434,14 @@ impl ScwollApp {
         Self {
             videos: load_videos(),
             theme: load_theme(),
+            system_blur: system_blur::SystemBlur::new(),
+            top_bar_bottom: 0.0,
             logo_tex,
+            bg_tex: None,
             active_category: "All".into(),
             source: SourceFilter::All,
             search: String::new(),
             selected: None,
-            show_import: false,
-            show_theme: false,
             settings_tab: SettingsTab::Appearance,
             system_fonts: list_system_fonts(),
             font_filter: String::new(),
@@ -2299,7 +2481,7 @@ impl ScwollApp {
         }
     }
 
-    fn finish_startup(self, ctx: &egui::Context) -> Self {
+    fn finish_startup(mut self, ctx: &egui::Context) -> Self {
         let selected = self
             .system_fonts
             .iter()
@@ -2307,6 +2489,12 @@ impl ScwollApp {
             .cloned();
         if let Err(e) = apply_ui_font(ctx, selected.as_ref()) {
             eprintln!("[scwoll] font: {e}");
+        }
+        if !self.theme.background_image.trim().is_empty() {
+            match load_background_texture(ctx, &self.theme.background_image) {
+                Ok(tex) => self.bg_tex = Some(tex),
+                Err(e) => eprintln!("[scwoll] background: {e}"),
+            }
         }
         self
     }
@@ -2726,9 +2914,22 @@ impl eframe::App for ScwollApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         apply_visuals(ctx, &self.theme);
-        paint_backdrop(ctx, &self.theme);
+        let screen = ctx.screen_rect().size() * ctx.pixels_per_point();
+        self.system_blur.sync(
+            self.theme.system_blur,
+            screen.x.max(1.0) as u32,
+            screen.y.max(1.0) as u32,
+            frame,
+        );
+        let system_blur_active = self.system_blur.active();
+        paint_backdrop(
+            ctx,
+            &self.theme,
+            self.bg_tex.as_ref(),
+            system_blur_active,
+        );
         self.pump_thumbs(ctx);
         self.pump_sources();
         self.pump_source_images(ctx);
@@ -2775,15 +2976,61 @@ impl eframe::App for ScwollApp {
                         self.search.clear();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.anim_button("⚙ Settings").on_hover_text("Appearance, font, glass and colour options").clicked() {
-                            self.show_theme = true;
+                        let settings = ui
+                            .anim_button("⚙ Settings")
+                            .on_hover_text("Appearance, font, glass and colour options");
+                        if settings.clicked() {
+                            toggle_dropdown(ui, settings_popup_id());
                         }
-                        if ui.anim_button("📥 Import").on_hover_text("Add videos from a URL, list or folder").clicked() {
-                            self.show_import = true;
+                        let import = ui
+                            .anim_button("📥 Import")
+                            .on_hover_text("Add videos from a URL, list or folder");
+                        if import.clicked() {
+                            toggle_dropdown(ui, import_popup_id());
+                        }
+
+                        let panel_bottom = if self.top_bar_bottom > 0.0 {
+                            self.top_bar_bottom
+                        } else {
+                            ui.max_rect().bottom() + 8.0
+                        };
+                        let settings_anchor = anchor_below_top_bar(&settings, panel_bottom);
+                        let import_anchor = anchor_below_top_bar(&import, panel_bottom);
+
+                        if ui.memory(|m| m.is_popup_open(settings_popup_id())) {
+                            ui.scope(|ui| {
+                                style_popup(ui, &self.theme);
+                                egui::popup::popup_below_widget(
+                                    ui,
+                                    settings_popup_id(),
+                                    &settings_anchor,
+                                    egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                                    |ui| {
+                                        ui.set_width(620.0);
+                                        self.settings_dropdown_contents(ui, muted);
+                                    },
+                                );
+                            });
+                        }
+                        if ui.memory(|m| m.is_popup_open(import_popup_id())) {
+                            ui.scope(|ui| {
+                                style_popup(ui, &self.theme);
+                                egui::popup::popup_below_widget(
+                                    ui,
+                                    import_popup_id(),
+                                    &import_anchor,
+                                    egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                                    |ui| {
+                                        ui.set_width(470.0);
+                                        self.import_dropdown_contents(ui);
+                                    },
+                                );
+                            });
                         }
                     });
                 });
             });
+        self.top_bar_bottom = top_resp.response.rect.bottom();
         paint_panel_edge(ctx, top_resp.response.rect, true, panel_line, panel_line2);
 
         // ---------------- sidebar ----------------
@@ -2885,12 +3132,7 @@ impl eframe::App for ScwollApp {
             }
         });
 
-        if self.show_import {
-            self.import_window(ctx);
-        }
-        if self.show_theme {
-            self.theme_window(ctx, accent, muted);
-        }        if self.show_cats {
+        if self.show_cats {
             self.categories_window(ctx, muted);
         }
 
@@ -2930,7 +3172,10 @@ impl ScwollApp {
                     ui.heading("📼 Nothing here yet");
                     ui.label("Import a URL, a .txt list, or a folder of videos.");
                     if ui.anim_button("📥 Import videos").clicked() {
-                        self.show_import = true;
+                        ui.memory_mut(|m| {
+                            m.close_popup();
+                            m.open_popup(import_popup_id());
+                        });
                     }
                 }
             });
@@ -2942,28 +3187,12 @@ impl ScwollApp {
             // the target width, then stretch cards to fill each row exactly.
             // Columns always fit — nothing runs off the right edge.
             let avail = ui.available_width().max(120.0);
-            let gap = egui::vec2(10.0, 10.0);
-            let target = (220.0 * self.theme.card_scale).clamp(140.0, 320.0);
+            let gap = egui::vec2(16.0, 20.0);
+            let target = (250.0 * self.theme.card_scale).clamp(140.0, 360.0);
             let cols = (((avail + gap.x) / (target + gap.x)).floor() as usize).max(1);
             let card_w =
                 ((avail - gap.x * (cols.saturating_sub(1) as f32)) / cols as f32).max(110.0);
-            // Frame adds inner margin + stroke; keep the content width a
-            // little narrower so the rounded glass card fits exactly.
-            let content_w = (card_w - 20.0).max(80.0);
-            let slot_h = content_w * 9.0 / 16.0;
-            let rounding = egui::Rounding::same(self.theme.radius.min(22) as f32);
-            let img_rounding = egui::Rounding::same((self.theme.radius.min(18) as f32 - 2.0).max(2.0));
-            let glass = self.theme.glass;
-            let surface = hex_to_color(&self.theme.surface);
-            let card_fill = with_alpha(surface, card_alpha(&self.theme), glass);
-            let card_stroke = alpha_color(
-                mix_color(hex_to_color(&self.theme.muted), accent, 0.35),
-                (22.0 + self.theme.glow as f32 * 1.35).min(140.0) as u8,
-            );
-            let card_shadow = theme_shadow(&self.theme);
-            let hover_glow = self.theme.hover_glow;
-            let glow_width = 1.0 + self.theme.glow as f32 / 70.0;
-            let glow_color = alpha_color(accent, (115.0 + self.theme.glow as f32 * 1.2).min(245.0) as u8);
+            let content_w = card_w.max(80.0);
 
             // Explicit grid rows: exactly `cols` cards per row, rows stacked
             // vertically inside the scroll area. No wrap heuristics — the
@@ -2971,226 +3200,19 @@ impl ScwollApp {
             // the right edge where it can't be reached.
             ui.spacing_mut().item_spacing.y = gap.y;
             for chunk in list.chunks(cols) {
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = gap.x;
                     for v in chunk.iter() {
                         let vid = v.clone();
                         self.request_thumb(v);
-                        let mut opened = false;
-                        let mut play = false;
-                        let mut delete = false;
-                        let mut fav_toggle = false;
-                        let mut new_cat: Option<String> = None;
-                        // ============ video box ============
-                        // Glass card: translucent fill, accent rim, soft depth
-                        // shadow and an optional glow on hover.
-                        let card = egui::Frame::none()
-                            .fill(card_fill)
-                            .stroke(egui::Stroke::new(1.0_f32, card_stroke))
-                            .rounding(rounding)
-                            .inner_margin(egui::Margin::same(8.0))
-                            .shadow(card_shadow)
-                            .show(ui, |ui| {
-                                // Pin the content width so the card (content +
-                                // margins) is exactly card_w — the wrapping row
-                                // can never push it past the window edge.
-                                ui.set_min_width(content_w);
-                                ui.set_max_width(content_w);
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                // Force vertical stacking inside the box: the wrapping
-                                // row outside hands down a HORIZONTAL layout, which is
-                                // what glued the buttons beside the thumbnail and threw
-                                // the second box lower (rows center uneven heights).
-                                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                                // (width already pinned above; no second set_width)
-                                let src = match vid.kind {
-                                    VideoKind::Youtube => "\u{25b6} YouTube",
-                                    VideoKind::Local => "\u{1F5C2} Local",
-                                    VideoKind::Direct => "\u{1F517} Link",
-                                };
-                                // top row of the box: source + category menu left,
-                                // favorite star right.
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    ui.label(egui::RichText::new(src).color(muted).small());
-                                    ui.label(egui::RichText::new("\u{00b7}").color(muted).small());
-                                    let cat_resp = ui.menu_button(
-                                        egui::RichText::new(format!("🏷 {} ▾", vid.category))
-                                            .color(accent)
-                                            .small()
-                                            .strong(),
-                                        |ui| {
-                                            for c in &all_cats {
-                                                if ui.anim_selectable_label(*c == vid.category, c.clone()).clicked() {
-                                                    new_cat = Some(c.clone());
-                                                    ui.close_menu();
-                                                }
-                                            }
-                                            ui.separator();
-                                            if ui.anim_selectable_label(false, "✎ Edit / new…").clicked() {
-                                                opened = true;
-                                                ui.close_menu();
-                                            }
-                                        },
-                                    );
-                                    cat_resp.response.on_hover_text("Change category");
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let star = if vid.favorite { "★" } else { "☆" };
-                                        if ui.anim_small_button(egui::RichText::new(star).color(if vid.favorite { accent } else { muted }))
-                                            .on_hover_text(if vid.favorite { "Remove from Favorites" } else { "Add to Favorites" })
-                                            .clicked()
-                                        {
-                                            fav_toggle = true;
-                                        }
-                                    });
-                                });
-                                ui.add_space(2.0);
-                                // thumbnail (click to open); aspect-fit into the
-                                // 16:9 slot. The box is only as tall as the
-                                // fitted image, so no dead space sits below it.
-                                let thumb_clicked = if let Some(tex) = self.thumb_cache.get(&vid.id) {
-                                    let ts = tex.size();
-                                    let s = (ts[0] as f32 / ts[1].max(1) as f32).clamp(0.2, 4.0);
-                                    let disp_w = (slot_h * s).min(content_w);
-                                    let disp = egui::vec2(disp_w.max(20.0), (disp_w / s).max(10.0));
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(content_w, disp.y),
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        |ui| {
-                                            let img = ui.add(
-                                                egui::Image::from_texture(tex)
-                                                    .fit_to_exact_size(disp)
-                                                    .rounding(img_rounding)
-                                                    .sense(egui::Sense::click()),
-                                            );
-                                            let hover_t = ui.ctx().animate_bool_with_time(
-                                                img.id.with("thumb-play"),
-                                                img.hovered(),
-                                                0.16,
-                                            );
-                                            if hover_t > 0.001 {
-                                                let center = img.rect.center();
-                                                let base_r = (disp.y * 0.16).clamp(15.0, 26.0);
-                                                let r = base_r * (0.68 + 0.32 * hover_t);
-                                                ui.painter().circle_filled(
-                                                    center,
-                                                    r,
-                                                    egui::Color32::from_black_alpha(
-                                                        (130.0 * hover_t) as u8,
-                                                    ),
-                                                );
-                                                ui.painter().circle_stroke(
-                                                    center,
-                                                    r,
-                                                    egui::Stroke::new(
-                                                        1.0_f32,
-                                                        alpha_color(
-                                                            egui::Color32::WHITE,
-                                                            (110.0 * hover_t) as u8,
-                                                        ),
-                                                    ),
-                                                );
-                                                ui.painter().text(
-                                                    center,
-                                                    egui::Align2::CENTER_CENTER,
-                                                    "▶",
-                                                    egui::FontId::proportional(r * 0.9),
-                                                    alpha_color(
-                                                        egui::Color32::WHITE,
-                                                        (255.0 * hover_t) as u8,
-                                                    ),
-                                                );
-                                            }
-                                            img.clicked()
-                                        },
-                                    )
-                                    .inner
-                                } else {
-                                    let letter = vid
-                                        .title
-                                        .chars()
-                                        .next()
-                                        .unwrap_or('\u{25b6}')
-                                        .to_uppercase()
-                                        .to_string();
-                                    let tile = ui.add_sized(
-                                        egui::vec2(content_w, slot_h),
-                                        AnimatedButton::new(
-                                            egui::RichText::new(letter)
-                                                .size(36.0)
-                                                .color(egui::Color32::WHITE),
-                                        )
-                                        .rounding(img_rounding)
-                                        .fill(placeholder_color(&vid.id)),
-                                    );
-                                    // Failed picture (.failed marker on disk):
-                                    // overlay a retry button in the middle.
-                                    if thumb_failed_file(&vid.id).exists() {
-                                        let retry = ui.put(
-                                            egui::Rect::from_center_size(
-                                                tile.rect.center(),
-                                                egui::vec2(76.0, 26.0),
-                                            ),
-                                            AnimatedButton::new("↻ Retry"),
-                                        );
-                                        if retry.clicked() {
-                                            self.retry_thumb(&vid);
-                                        }
-                                    }
-                                    tile.clicked()
-                                };
-                                if thumb_clicked {
-                                    opened = true;
-                                }
-                                // one compact button row directly under the image;
-                                // exact thirds of the content width so it fits.
-                                ui.add_space(2.0);
-                                let bw = (content_w - gap.x * 2.0) / 3.0;
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = gap.x;
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(bw, 22.0),
-                                            AnimatedButton::new(
-                                                egui::RichText::new("\u{25b6} Play")
-                                                    .color(egui::Color32::WHITE),
-                                            )
-                                            .fill(accent),
-                                        )
-                                        .clicked()
-                                    {
-                                        play = true;
-                                    }
-                                    if ui
-                                        .add_sized(egui::vec2(bw, 22.0), AnimatedButton::new("Open"))
-                                        .clicked()
-                                    {
-                                        opened = true;
-                                    }
-                                    if ui
-                                        .add_sized(egui::vec2(bw, 22.0), AnimatedButton::new("\u{1F5D1}"))
-                                        .on_hover_text("Delete")
-                                        .clicked()
-                                    {
-                                        delete = true;
-                                    }
-                                });
-                                // title: one truncated line — compact, and every
-                                // card stays the same height so rows line up.
-                                ui.label(
-                                    egui::RichText::new(shorten_title(&vid.title, content_w))
-                                        .strong(),
-                                );
-                                });
-                            });
-                        if hover_glow && card.response.hovered() {
-                            ui.painter().rect_stroke(
-                                card.response.rect.shrink(0.5),
-                                rounding,
-                                egui::Stroke::new(glow_width, glow_color),
-                            );
-                        }
-                        if opened {
+                        let CardAction {
+                            open,
+                            play,
+                            delete,
+                            favorite,
+                            new_cat,
+                        } = self.show_youtube_card(ui, &vid, content_w, &all_cats, accent, muted);
+                        if open {
                             self.selected = Some(vid.id.clone());
                             self.edit_title = vid.title.clone();
                             self.edit_cat = vid.category.clone();
@@ -3210,7 +3232,7 @@ impl ScwollApp {
                                 self.toast(format!("Moved to \"{c}\" ✓"));
                             }
                         }
-                        if fav_toggle {
+                        if favorite {
                             let now_fav = if let Some(slot) = self.videos.iter_mut().find(|x| x.id == vid.id) {
                                 slot.favorite = !slot.favorite;
                                 slot.favorite
@@ -3224,6 +3246,213 @@ impl ScwollApp {
                     });
             }
         });
+    }
+
+    /// YouTube-style card: a large rounded thumbnail, then an avatar, title,
+    /// channel/category line and metadata. Right-click the thumbnail for
+    /// play / details / favorites / category / delete actions.
+    fn show_youtube_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        vid: &Video,
+        content_w: f32,
+        all_cats: &[String],
+        accent: egui::Color32,
+        muted: egui::Color32,
+    ) -> CardAction {
+        let mut act = CardAction::default();
+        let radius = egui::Rounding::same((self.theme.radius.min(18) as f32).max(8.0));
+        let thumb_h = content_w * 9.0 / 16.0;
+        let hover_glow = self.theme.hover_glow;
+        let glow_width = 1.0 + self.theme.glow as f32 / 70.0;
+        let glow_color = alpha_color(accent, (115.0 + self.theme.glow as f32 * 1.2).min(245.0) as u8);
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(content_w, 0.0),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            let (thumb_rect, thumb_clicked) = if let Some(tex) = self.thumb_cache.get(&vid.id) {
+                let img = ui.add(
+                    egui::Image::from_texture(tex)
+                        .fit_to_exact_size(egui::vec2(content_w, thumb_h))
+                        .maintain_aspect_ratio(false)
+                        .rounding(radius)
+                        .sense(egui::Sense::click()),
+                );
+                img.context_menu(|ui| youtube_card_menu(ui, vid, all_cats, &mut act));
+                let hover_t = ui.ctx().animate_bool_with_time(
+                    img.id.with("yt-thumb-play"),
+                    img.hovered(),
+                    0.16,
+                );
+                if hover_t > 0.001 {
+                    let center = img.rect.center();
+                    let base_r = (thumb_h * 0.16).clamp(16.0, 30.0);
+                    let r = base_r * (0.68 + 0.32 * hover_t);
+                    ui.painter().circle_filled(
+                        center,
+                        r,
+                        egui::Color32::from_black_alpha((145.0 * hover_t) as u8),
+                    );
+                    ui.painter().circle_stroke(
+                        center,
+                        r,
+                        egui::Stroke::new(
+                            1.0_f32,
+                            alpha_color(egui::Color32::WHITE, (110.0 * hover_t) as u8),
+                        ),
+                    );
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        "▶",
+                        egui::FontId::proportional(r * 0.9),
+                        alpha_color(egui::Color32::WHITE, (255.0 * hover_t) as u8),
+                    );
+                }
+                if hover_glow && img.hovered() {
+                    ui.painter().rect_stroke(
+                        img.rect,
+                        radius,
+                        egui::Stroke::new(glow_width, glow_color),
+                    );
+                }
+                (img.rect, img.clicked())
+            } else {
+                let letter = vid
+                    .title
+                    .chars()
+                    .next()
+                    .unwrap_or('\u{25b6}')
+                    .to_uppercase()
+                    .to_string();
+                let tile = ui.add_sized(
+                    egui::vec2(content_w, thumb_h),
+                    AnimatedButton::new(
+                        egui::RichText::new(letter)
+                            .size(42.0)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .rounding(radius)
+                    .fill(placeholder_color(&vid.id)),
+                );
+                tile.context_menu(|ui| youtube_card_menu(ui, vid, all_cats, &mut act));
+                if thumb_failed_file(&vid.id).exists() {
+                    let retry = ui.put(
+                        egui::Rect::from_center_size(
+                            tile.rect.center(),
+                            egui::vec2(84.0, 28.0),
+                        ),
+                        AnimatedButton::new("↻ Retry"),
+                    );
+                    if retry.clicked() {
+                        self.retry_thumb(vid);
+                    }
+                }
+                (tile.rect, tile.clicked())
+            };
+            if thumb_clicked {
+                act.open = true;
+            }
+
+            // Duration-style badge in the bottom-right of the thumbnail.
+            let badge_text = shorten_title(&vid.category, content_w * 0.45);
+            let galley = ui.painter().layout_no_wrap(
+                badge_text,
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+            let pad = egui::vec2(6.0, 2.0);
+            let badge_size = galley.size() + pad * 2.0;
+            let badge_rect = egui::Rect::from_min_size(
+                thumb_rect.right_bottom() - egui::vec2(badge_size.x + 6.0, badge_size.y + 6.0),
+                badge_size,
+            );
+            ui.painter().rect_filled(
+                badge_rect,
+                egui::Rounding::same(4.0),
+                egui::Color32::from_black_alpha(200),
+            );
+            ui.painter().galley(badge_rect.min + pad, galley, egui::Color32::WHITE);
+            if vid.favorite {
+                ui.painter().text(
+                    thumb_rect.right_top() + egui::vec2(-8.0, 8.0),
+                    egui::Align2::RIGHT_TOP,
+                    "★",
+                    egui::FontId::proportional(15.0),
+                    accent,
+                );
+            }
+
+            ui.add_space(7.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let compact = content_w < 190.0;
+                let avatar_size = if compact { 26.0 } else { 34.0 };
+                let avatar_gap = if compact { 5.0 } else { 8.0 };
+                let (avatar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(avatar_size, avatar_size), egui::Sense::hover());
+                let painter = ui.painter();
+                painter.circle_filled(
+                    avatar_rect.center(),
+                    avatar_size / 2.0,
+                    placeholder_color(&vid.category),
+                );
+                let initial = vid
+                    .category
+                    .chars()
+                    .next()
+                    .unwrap_or('\u{25b6}')
+                    .to_uppercase()
+                    .to_string();
+                painter.text(
+                    avatar_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initial,
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::WHITE,
+                );
+
+                ui.add_space(avatar_gap);
+                let info_w = (content_w - avatar_size - avatar_gap).max(20.0);
+                ui.vertical(|ui| {
+                    ui.set_width(info_w);
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let title = shorten_title(&vid.title, info_w * 1.9);
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(title).strong().size(14.5),
+                    ).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(vid.category.clone())
+                                .color(accent)
+                                .small(),
+                        )
+                        .truncate(),
+                    );
+                    let source = match vid.kind {
+                        VideoKind::Youtube => "▶ YouTube",
+                        VideoKind::Local => "🗂 Local",
+                        VideoKind::Direct => "🔗 Link",
+                    };
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{source} · {}",
+                                relative_age(&vid.added_at)
+                            ))
+                            .color(muted)
+                            .small(),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+        },
+        );
+        act
     }
 
     /// Sources home page: every saved source in one place. Add URLs
@@ -3744,21 +3973,28 @@ impl ScwollApp {
         });
     }
 
-    // ------------------------------------------------------------ windows --
-    fn import_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_import;
-        egui::Window::new("📥 Import videos")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(480.0)
-            .max_height(560.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.anim_selectable_value(&mut self.import_tab, ImportTab::Url, "Single URL");
-                    ui.anim_selectable_value(&mut self.import_tab, ImportTab::List, "List / .txt");
-                    ui.anim_selectable_value(&mut self.import_tab, ImportTab::Folder, "Folder");
-                });
-                ui.separator();
+    // ------------------------------------------------------- top-bar popups --
+    fn import_dropdown_contents(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.horizontal(|ui| {
+            ui.anim_selectable_value(&mut self.import_tab, ImportTab::Url, "Single URL");
+            ui.anim_selectable_value(&mut self.import_tab, ImportTab::List, "List / .txt");
+            ui.anim_selectable_value(&mut self.import_tab, ImportTab::Folder, "Folder");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .anim_small_button("✖")
+                    .on_hover_text("Close import")
+                    .clicked()
+                {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height((ctx.screen_rect().height() * 0.58).max(240.0))
+            .show(ui, |ui| {
                 match self.import_tab {
                     ImportTab::Url => {
                         ui.label("Video URL (YouTube, mp4, …)");
@@ -3863,33 +4099,39 @@ impl ScwollApp {
                     }
                 }
             });
-        self.show_import = open;
     }
 
-    fn theme_window(&mut self, ctx: &egui::Context, _accent: egui::Color32, muted: egui::Color32) {
-        let mut open = self.show_theme;
+    fn settings_dropdown_contents(&mut self, ui: &mut egui::Ui, muted: egui::Color32) {
+        let ctx = ui.ctx().clone();
         let mut changed = false;
         let mut preset_msg: Option<String> = None;
         let mut font_job: Option<Option<SystemFont>> = None;
         let previous_font = self.theme.font.clone();
-        egui::Window::new("⚙ Settings")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(465.0)
-            .max_height(650.0)
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "✨ Appearance");
-                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Font, "🔤 Font");
-                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Glass, "🧊 Glass & motion");
-                    ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Colors, "🎨 Colors");
-                });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .max_height(535.0)
-                    .show(ui, |ui| {
-                        match self.settings_tab {
+        let mut bg_job: Option<Option<String>> = None;
+        let previous_bg = self.theme.background_image.clone();
+        let blur_status = self.system_blur.status().to_owned();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Appearance, "✨ Appearance");
+            ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Font, "🔤 Font");
+            ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Glass, "🧊 Glass & motion");
+            ui.anim_selectable_value(&mut self.settings_tab, SettingsTab::Colors, "🎨 Colors");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .anim_small_button("✖")
+                    .on_hover_text("Close settings")
+                    .clicked()
+                {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height((ctx.screen_rect().height() * 0.68).max(260.0))
+            .show(ui, |ui| {
+                match self.settings_tab {
                             SettingsTab::Appearance => {
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("UI font").strong());
@@ -4116,6 +4358,71 @@ impl ScwollApp {
                             }
                             SettingsTab::Glass => {
                                 ui.label(egui::RichText::new("Glass & backdrop").strong());
+                                ui.label(egui::RichText::new("Custom background image").strong());
+                                ui.horizontal_wrapped(|ui| {
+                                    let file_label = if self.theme.background_image.trim().is_empty() {
+                                        "None".to_owned()
+                                    } else {
+                                        Path::new(&self.theme.background_image)
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or(&self.theme.background_image)
+                                            .to_owned()
+                                    };
+                                    ui.label(file_label)
+                                        .on_hover_text(&self.theme.background_image);
+                                    if ui.anim_button("📁 Choose…").clicked() {
+                                        if let Some(file) = rfd::FileDialog::new()
+                                            .add_filter("images", &["png", "jpg", "jpeg"])
+                                            .pick_file()
+                                        {
+                                            let path = file.to_string_lossy().to_string();
+                                            self.theme.background_image = path.clone();
+                                            bg_job = Some(Some(path));
+                                            changed = true;
+                                        }
+                                    }
+                                    if !self.theme.background_image.trim().is_empty()
+                                        && ui.anim_button("🗑 Clear").clicked()
+                                    {
+                                        self.theme.background_image.clear();
+                                        bg_job = Some(None);
+                                        changed = true;
+                                    }
+                                });
+                                if !self.theme.background_image.trim().is_empty() {
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.theme.background_image_dim,
+                                                0..=100,
+                                            )
+                                            .text("Image dim")
+                                            .suffix("%"),
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                    if self.bg_tex.is_none() {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Image not loaded (missing or unsupported file).",
+                                            )
+                                            .color(muted)
+                                            .small(),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "The image is center-cropped to fill the window. Raise Image dim if text is hard to read.",
+                                        )
+                                        .color(muted)
+                                        .small(),
+                                    );
+                                }
+                                ui.add_space(4.0);
+                                ui.separator();
                                 if ui
                                     .add(
                                         egui::Slider::new(&mut self.theme.background_transparency, 0..=100)
@@ -4129,6 +4436,44 @@ impl ScwollApp {
                                 {
                                     changed = true;
                                 }
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.label(egui::RichText::new("System blur (compositor)").strong());
+                                if ui
+                                    .checkbox(
+                                        &mut self.theme.system_blur,
+                                        "Blur the desktop behind Scwoll",
+                                    )
+                                    .on_hover_text(
+                                        "Ask the compositor for real backdrop blur (KWin/Wayland ext-background-effect-v1, or the X11 _KDE_NET_WM_BLUR_BEHIND_REGION property).",
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                                ui.add_enabled_ui(self.theme.system_blur, |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut self.theme.system_blur_intensity,
+                                                0..=100,
+                                            )
+                                            .text("Blur intensity")
+                                            .suffix("%"),
+                                        )
+                                        .on_hover_text(
+                                            "Fades Scwoll's own backdrop so more of the compositor's blurred desktop shows through. The blur radius itself is controlled by the desktop's blur effect.",
+                                        )
+                                        .changed()
+                                    {
+                                        changed = true;
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(blur_status)
+                                        .color(muted)
+                                        .small(),
+                                );
                                 if ui
                                     .add(
                                         egui::Slider::new(&mut self.theme.blur, 0..=40)
@@ -4140,7 +4485,7 @@ impl ScwollApp {
                                 }
                                 ui.label(
                                     egui::RichText::new(
-                                        "egui cannot sample the desktop behind the window, so blur is a soft translucent simulation: higher values widen the frosted tint and background light.",
+                                        "System blur is real compositor blur; the Frost / blur slider below is Scwoll's simulated fallback. Raise Blur intensity to reveal more of the real blur.",
                                     )
                                     .color(muted)
                                     .small(),
@@ -4240,12 +4585,13 @@ impl ScwollApp {
                                 ui.small("Accent 2 is used by the background aurora and gradient panel edges.");
                             }
                         }
-                    });
-                ui.separator();
+            });
+        ui.separator();
                 ui.horizontal(|ui| {
                     if ui.anim_button("Reset defaults").clicked() {
                         self.theme = Theme::default();
                         font_job = Some(None);
+                        bg_job = Some(None);
                         changed = true;
                         preset_msg = Some("Defaults restored".into());
                     }
@@ -4257,10 +4603,8 @@ impl ScwollApp {
                         ui.label(egui::RichText::new("auto-saved to data/theme.json").color(muted).small());
                     });
                 });
-            });
-        self.show_theme = open;
         if let Some(job) = font_job {
-            match apply_ui_font(ctx, job.as_ref()) {
+            match apply_ui_font(&ctx, job.as_ref()) {
                 Ok(()) => {
                     if changed {
                         save_theme(&self.theme);
@@ -4274,6 +4618,19 @@ impl ScwollApp {
             }
         } else if changed {
             save_theme(&self.theme);
+        }
+        if let Some(job) = bg_job {
+            match job {
+                Some(path) => match load_background_texture(&ctx, &path) {
+                    Ok(tex) => self.bg_tex = Some(tex),
+                    Err(e) => {
+                        self.theme.background_image = previous_bg;
+                        save_theme(&self.theme);
+                        self.toast(format!("Background error: {e}"));
+                    }
+                },
+                None => self.bg_tex = None,
+            }
         }
         if let Some(msg) = preset_msg {
             self.toast(msg);

@@ -101,6 +101,19 @@ pub struct Theme {
     /// UI font family chosen from the system (fontconfig). Empty = egui's bundled fonts.
     #[serde(default)]
     pub font: String,
+    /// Optional custom background image (file path). Empty = generated backdrop.
+    #[serde(default)]
+    pub background_image: String,
+    /// Darkening/scrim strength over the custom background image (0-100).
+    #[serde(default = "default_background_image_dim")]
+    pub background_image_dim: u8,
+    /// Ask the desktop compositor to blur what is behind the window.
+    #[serde(default)]
+    pub system_blur: bool,
+    /// How much of Scwoll's own backdrop is faded out to reveal the
+    /// compositor blur (0-100). The blur radius itself is a compositor setting.
+    #[serde(default = "default_system_blur_intensity")]
+    pub system_blur_intensity: u8,
 }
 
 fn default_style() -> String {
@@ -172,6 +185,12 @@ fn c_accent2() -> String {
 fn default_card_scale() -> f32 {
     1.0
 }
+fn default_background_image_dim() -> u8 {
+    45
+}
+fn default_system_blur_intensity() -> u8 {
+    60
+}
 
 impl Default for Theme {
     fn default() -> Self {
@@ -200,6 +219,10 @@ impl Default for Theme {
             accent2: c_accent2(),
             card_scale: default_card_scale(),
             font: String::new(),
+            background_image: String::new(),
+            background_image_dim: default_background_image_dim(),
+            system_blur: false,
+            system_blur_intensity: default_system_blur_intensity(),
         }
     }
 }

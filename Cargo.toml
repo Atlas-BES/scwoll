@@ -21,3 +21,11 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5"
 wait-timeout = "0.2"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "0.2", features = ["client"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+x11rb = "0.13"
