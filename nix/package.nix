@@ -3,6 +3,7 @@
   rustPlatform,
   pkg-config,
   makeWrapper,
+  makeDesktopItem,
   mpv,
   ffmpeg,
   yt-dlp,
@@ -59,6 +60,7 @@ rustPlatform.buildRustPackage rec {
       ../Cargo.lock
       ../src
       ../logo.png
+      ../assets/scwoll.png
     ];
   };
 
@@ -84,6 +86,34 @@ rustPlatform.buildRustPackage rec {
     wrapProgram $out/bin/scwoll \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs} \
       --prefix PATH : ${lib.makeBinPath runtimeTools}
+  '';
+
+  desktopItem = makeDesktopItem {
+    name = "scwoll";
+    desktopName = "Scwoll";
+    genericName = "Media Player";
+    comment = "Native YouTube-style media player (Rust, mpv playback)";
+    exec = "scwoll";
+    icon = "scwoll";
+    categories = [
+      "AudioVideo"
+      "Video"
+      "Player"
+    ];
+    keywords = [
+      "video"
+      "player"
+      "youtube"
+      "mpv"
+    ];
+    startupWMClass = "scwoll";
+  };
+
+  postInstall = ''
+    install -Dm644 ${desktopItem}/share/applications/scwoll.desktop \
+      $out/share/applications/scwoll.desktop
+    install -Dm644 ${../assets/scwoll.png} \
+      $out/share/icons/hicolor/512x512/apps/scwoll.png
   '';
 
   meta = with lib; {

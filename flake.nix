@@ -45,6 +45,11 @@
         scwoll = final.callPackage ./nix/package.nix { };
       };
 
+      homeManagerModules = {
+        default = ./nix/hm-module.nix;
+        scwoll = ./nix/hm-module.nix;
+      };
+
       formatter = forAllSystems (system: pkgs: pkgs.nixfmt);
     };
 }

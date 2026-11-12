@@ -114,11 +114,39 @@ runtime without any shell setup.
 }
 ```
 
-For home-manager, use the same path in `home.packages`:
+For home-manager, import the module and enable the option:
 
 ```nix
-home.packages = [ inputs.scwoll.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+{
+  inputs.scwoll.url = "github:Atlas-BES/scwoll";
+
+  outputs = { self, nixpkgs, home-manager, scwoll, ... }: {
+    homeConfigurations.me = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [
+        scwoll.homeManagerModules.default
+        ({ pkgs, ... }: {
+          programs.scwoll = {
+            enable = true;
+            # Optional: use the flake's pinned/cached build instead of
+            # rebuilding with your own nixpkgs.
+            # package = scwoll.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          };
+        })
+      ];
+    };
+  };
+}
 ```
+
+The module provides:
+
+- `programs.scwoll.enable` — install Scwoll (adds `programs.scwoll.package` to `home.packages`)
+- `programs.scwoll.package` — package to install, defaulting to a build from the
+  flake source with your own `pkgs`
+
+The package ships a `.desktop` entry and a hicolor icon, so enabling the
+module also adds Scwoll to your application launcher.
 
 > Flakes only see files tracked by Git. If `nix build` complains about a
 > missing module or source file, `git add` it first (or commit before
@@ -134,9 +162,10 @@ src/
   system_blur.rs  # compositor blur request (Wayland ext-background-effect / X11)
 sample_urls.txt   # sample bulk-import list
 shell.nix         # cargo + eframe system libs (GL/wayland/xkb/gtk)
-flake.nix         # flake outputs: packages / apps / devShells / overlay
-nix/package.nix   # buildRustPackage derivation (wrapped runtime PATH + libs)
+flake.nix         # flake outputs: packages / apps / devShells / overlay / HM module
+nix/package.nix   # buildRustPackage derivation (wrapped runtime PATH + libs + desktop entry)
 nix/devshell.nix  # `nix develop` environment
+nix/hm-module.nix # home-manager module (`programs.scwoll.enable`)
 data/             # library.json + theme.json (created on first run)
 ```
 
