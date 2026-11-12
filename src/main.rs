@@ -17,8 +17,50 @@ use eframe::egui;
 use model::*;
 
 // ------------------------------------------------------------ persistence --
+/// Where Scwoll keeps `library.json`, `theme.json`, thumbnails, …
+/// Follows the XDG base-dir spec: `$XDG_CONFIG_HOME/scwoll`, falling back to
+/// `~/.config/scwoll`. (An explicit `XDG_CONFIG_HOME` wins, as usual.)
 fn data_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("scwoll");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        return PathBuf::from(home).join(".config").join("scwoll");
+    }
+    // Last resort for environments without HOME (e.g. odd CI shells).
     PathBuf::from("data")
+}
+
+/// One-time copy of the old CWD-relative `./data` dir into the XDG config dir,
+/// so an existing library/theme survives the switch. Never overwrites data
+/// that is already in the new location, and leaves `./data` in place.
+fn migrate_legacy_data() {
+    let legacy = PathBuf::from("data");
+    let dest = data_dir();
+    if dest == legacy || dest.starts_with(&legacy) || !legacy.is_dir() || dest.join("library.json").exists() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    match copy_dir_all(&legacy, &dest) {
+        Ok(()) => eprintln!("[scwoll] migrated data {} -> {}", legacy.display(), dest.display()),
+        Err(e) => eprintln!("[scwoll] could not migrate {}: {e}", legacy.display()),
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 fn lib_path() -> PathBuf {
     data_dir().join("library.json")
@@ -189,7 +231,7 @@ fn apply_ui_font(ctx: &egui::Context, font: Option<&SystemFont>) -> Result<(), S
 
 // --------------------------------------------------------------- sources --
 // Bookmarked HTML pages the user can browse inside the app for videos and
-// links. Stored in data/sources.json (separate from library.json so old
+// links. Stored in the config dir's sources.json (separate from library.json so old
 // libraries keep loading). Pages are fetched with ureq on worker threads;
 // links are extracted with a tiny href scanner (no extra deps).
 fn sources_path() -> PathBuf {
@@ -1843,7 +1885,7 @@ impl Player {
 }
 
 // -------------------------------------------------------------- thumbnails --
-// Priority: disk cache (data/thumbs/<id>.jpg) -> YouTube thumbnail image ->
+// Priority: disk cache (<config>/thumbs/<id>.jpg) -> YouTube thumbnail image ->
 // 6-frame mosaic spread across the whole video (the only fallback).
 // Anything that still has nothing keeps the letter tile.
 enum ThumbMsg {
@@ -2515,7 +2557,7 @@ impl ScwollApp {
     }
 
     /// Delete a video and its cached thumbnail files.
-    /// Removes `data/thumbs/<id>.jpg` + `<id>.failed`, drops any
+    /// Removes `<config>/thumbs/<id>.jpg` + `<id>.failed`, drops any
     /// in-memory texture / pending job, stops playback of it, persists.
     fn delete_video(&mut self, id: &str) {
         if self.player.current_id.as_deref() == Some(id) {
@@ -4611,7 +4653,7 @@ impl ScwollApp {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("auto-saved to data/theme.json").color(muted).small());
+                        ui.label(egui::RichText::new(format!("data: {}", data_dir().display())).color(muted).small());
                     });
                 });
         if let Some(job) = font_job {
@@ -4708,6 +4750,7 @@ impl ScwollApp {
 
 // ------------------------------------------------------------------ main --
 fn main() -> eframe::Result<()> {
+    migrate_legacy_data();
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

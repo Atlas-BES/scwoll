@@ -16,14 +16,14 @@
   **6-frame mosaic** — 6 frames evenly spaced across the full duration,
   square-cropped and tiled 3×2. Two engines: `ffprobe`+`ffmpeg` (fast, precise)
   then pure-`mpv` percent-seeks (works anywhere `mpv` exists, incl. YouTube
-  links). Cached in `data/thumbs/`; last resort is a letter tile
+  links). Cached in `~/.config/scwoll/thumbs/`; last resort is a letter tile
 - **Themes & visual effects** (`⚙ Settings`)
   - **System font picker** (`🔤 Font`) — search and apply any font family
     installed via fontconfig; missing glyphs/emoji fall back to the bundled
-    fonts and the choice is saved in `data/theme.json`
+    fonts and the choice is saved in `~/.config/scwoll/theme.json`
   - **Custom background image** (`🧊 Glass & motion`) — pick a PNG/JPEG,
     center-cropped to fill the window, with an image-dim slider and path
-    saved in `data/theme.json`
+    saved in `~/.config/scwoll/theme.json`
   - **Presets** — ✨ Liquid Glass, Frosted, Neon, OLED, Minimal
   - **Liquid glass** toggle with panel opacity, corner radius, card size,
     shadow/depth and accent glow
@@ -45,8 +45,8 @@
     border, glow and expansion on hover
   - Fully customizable colors: accent, accent 2 / aurora, background,
     cards/windows, inputs, text, muted text and sidebar. Saved to
-    `data/theme.json`
-- **Persistence** — `data/library.json` + `data/theme.json` (3 demo videos seeded on first run); **⚙ Settings → 📁 Data folder** opens the data directory in your file manager
+    `~/.config/scwoll/theme.json`
+- **Persistence** — `~/.config/scwoll/library.json` + `theme.json` (3 demo videos seeded on first run); the directory follows `$XDG_CONFIG_HOME` when set. **⚙ Settings → 📁 Data folder** opens it in your file manager. An existing CWD-relative `data/` folder is copied over automatically on first launch
 
 ## Run
 
@@ -166,7 +166,7 @@ flake.nix         # flake outputs: packages / apps / devShells / overlay / HM mo
 nix/package.nix   # buildRustPackage derivation (wrapped runtime PATH + libs + desktop entry)
 nix/devshell.nix  # `nix develop` environment
 nix/hm-module.nix # home-manager module (`programs.scwoll.enable`)
-data/             # library.json + theme.json (created on first run)
+~/.config/scwoll/ # library.json + theme.json + thumbs (created on first run)
 ```
 
 ## Tests
