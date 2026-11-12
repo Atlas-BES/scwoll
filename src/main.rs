@@ -4599,6 +4599,17 @@ impl ScwollApp {
                         save_theme(&self.theme);
                         preset_msg = Some("Settings saved".into());
                     }
+                    if ui
+                        .anim_button("📁 Data folder")
+                        .on_hover_text("Open the folder containing library.json, theme.json and thumbnails")
+                        .clicked()
+                    {
+                        std::fs::create_dir_all(data_dir()).ok();
+                        let dir = std::fs::canonicalize(data_dir()).unwrap_or_else(|_| data_dir());
+                        if let Err(e) = open::that(&dir) {
+                            self.toast(format!("Could not open data folder: {e}"));
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(egui::RichText::new("auto-saved to data/theme.json").color(muted).small());
                     });

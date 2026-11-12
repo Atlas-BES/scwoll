@@ -46,7 +46,7 @@
   - Fully customizable colors: accent, accent 2 / aurora, background,
     cards/windows, inputs, text, muted text and sidebar. Saved to
     `data/theme.json`
-- **Persistence** — `data/library.json` + `data/theme.json` (3 demo videos seeded on first run)
+- **Persistence** — `data/library.json` + `data/theme.json` (3 demo videos seeded on first run); **⚙ Settings → 📁 Data folder** opens the data directory in your file manager
 
 ## Run
 
