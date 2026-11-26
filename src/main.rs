@@ -5,6 +5,11 @@
 mod model;
 mod system_blur;
 
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+mod mobile;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -37,7 +42,16 @@ fn data_dir() -> PathBuf {
 fn migrate_legacy_data() {
     let legacy = PathBuf::from("data");
     let dest = data_dir();
-    if dest == legacy || dest.starts_with(&legacy) || !legacy.is_dir() || dest.join("library.json").exists() {
+    // Only migrate when `./data` actually looks like Scwoll's own legacy
+    // data dir. This also keeps Android (where the CWD is `/` and `./data`
+    // resolves to the system `/data` directory) from ever copying the wrong
+    // tree into the app's private data directory.
+    if dest == legacy
+        || dest.starts_with(&legacy)
+        || !legacy.is_dir()
+        || !legacy.join("library.json").exists()
+        || dest.join("library.json").exists()
+    {
         return;
     }
     if let Some(parent) = dest.parent() {
@@ -1864,21 +1878,48 @@ impl Player {
             self.status = "Nothing to play (empty path/URL).".into();
             return;
         }
-        if v.kind == VideoKind::Local && !Path::new(&target).exists() {
-            self.status = format!("File missing on disk:\n{target}");
+
+        // Android has no mpv: hand the media to the system video player (or the
+        // YouTube app for YouTube links) with an ACTION_VIEW intent.
+        #[cfg(target_os = "android")]
+        {
+            let mime = match v.kind {
+                VideoKind::Youtube => None,
+                _ => Some("video/*"),
+            };
+            match android::open_video(&target, mime) {
+                Ok(()) => {
+                    self.current_id = Some(v.id.clone());
+                    self.status = format!("▶ Opened in the system player:\n{}", v.title);
+                }
+                Err(e) => {
+                    self.status = format!(
+                        "Could not open a player for this video ({e}).\nInstall a video player app."
+                    );
+                }
+            }
             return;
         }
-        match Command::new("mpv")
-            .args(["--no-terminal", "--force-window=yes", "--title=scwoll", &target])
-            .spawn()
+
+        #[cfg(not(target_os = "android"))]
         {
-            Ok(c) => {
-                self.child = Some(c);
-                self.current_id = Some(v.id.clone());
-                self.status = format!("▶ Playing in mpv:\n{}", v.title);
+            if v.kind == VideoKind::Local && !Path::new(&target).exists() {
+                self.status = format!("File missing on disk:\n{target}");
+                return;
             }
-            Err(e) => {
-                self.status = format!("Could not launch mpv ({e}).\nInstall mpv to play videos.");
+            match Command::new("mpv")
+                .args(["--no-terminal", "--force-window=yes", "--title=scwoll", &target])
+                .spawn()
+            {
+                Ok(c) => {
+                    self.child = Some(c);
+                    self.current_id = Some(v.id.clone());
+                    self.status = format!("▶ Playing in mpv:\n{}", v.title);
+                }
+                Err(e) => {
+                    self.status =
+                        format!("Could not launch mpv ({e}).\nInstall mpv to play videos.");
+                }
             }
         }
     }
@@ -2207,6 +2248,16 @@ fn load_thumb_bytes(v: &Video) -> Option<Vec<u8>> {
     if v.kind == VideoKind::Local && !Path::new(&input).exists() {
         return None;
     }
+    // Android: no ffmpeg/mpv, but the platform decodes media itself.
+    #[cfg(target_os = "android")]
+    if let Some(b) = android::video_thumb_jpeg(&input, 640) {
+        if let Some(parent) = cache.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&cache, &b).ok();
+        std::fs::remove_file(thumb_failed_file(&v.id)).ok();
+        return Some(b);
+    }
     if let Some(b) = grab_mosaic_bytes(&input) {
         if let Some(parent) = cache.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -2387,6 +2438,16 @@ struct ScwollApp {
     edit_title: String,
     edit_cat: String,
     show_cats: bool,
+    // Material You (Android) sheets
+    m3_search_open: bool,
+    m3_settings_open: bool,
+    m3_import_open: bool,
+    /// System bar inset in physical pixels + when it was last read (Android
+    /// keeps the status/navigation bars visible, so the UI pads around them).
+    #[cfg(target_os = "android")]
+    m3_insets: (f32, f32),
+    #[cfg(target_os = "android")]
+    m3_insets_at: Option<Instant>,
     cat_edit_buf: HashMap<String, String>,
     // sources: bookmarked HTML pages browsed in-app
     sources: Vec<Source>,
@@ -2500,6 +2561,13 @@ impl ScwollApp {
             edit_title: String::new(),
             edit_cat: String::new(),
             show_cats: false,
+            m3_search_open: false,
+            m3_settings_open: false,
+            m3_import_open: false,
+            #[cfg(target_os = "android")]
+            m3_insets: (0.0, 0.0),
+            #[cfg(target_os = "android")]
+            m3_insets_at: None,
             cat_edit_buf: HashMap::new(),
             sources: load_sources(),
             showing_sources: false,
@@ -2957,21 +3025,40 @@ impl eframe::App for ScwollApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        apply_visuals(ctx, &self.theme);
-        let screen = ctx.screen_rect().size() * ctx.pixels_per_point();
-        self.system_blur.sync(
-            self.theme.system_blur,
-            screen.x.max(1.0) as u32,
-            screen.y.max(1.0) as u32,
-            frame,
-        );
-        let system_blur_active = self.system_blur.active();
-        paint_backdrop(
-            ctx,
-            &self.theme,
-            self.bg_tex.as_ref(),
-            system_blur_active,
-        );
+        #[cfg(target_os = "android")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[scwoll] screen_rect={:?} ppp={}",
+                    ctx.screen_rect(),
+                    ctx.pixels_per_point()
+                );
+            }
+        }
+        // Android phones get the Material 3 layout (single column, bottom nav,
+        // dialogs); the glass/multi-pane desktop UI needs a wide window.
+        #[cfg(target_os = "android")]
+        {
+            let _ = frame;
+            self.mobile_ui(ctx);
+            return;
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            apply_visuals(ctx, &self.theme);
+            let screen = ctx.screen_rect().size() * ctx.pixels_per_point();
+            self.system_blur.sync(
+                self.theme.system_blur,
+                screen.x.max(1.0) as u32,
+                screen.y.max(1.0) as u32,
+                frame,
+            );
+            let system_blur_active = self.system_blur.active();
+            paint_backdrop(ctx, &self.theme, self.bg_tex.as_ref(), system_blur_active);
+        }
         self.pump_thumbs(ctx);
         self.pump_sources();
         self.pump_source_images(ctx);
@@ -2988,12 +3075,20 @@ impl eframe::App for ScwollApp {
         let panel_line = alpha_color(accent, (45.0 + self.theme.glow as f32 * 1.5).min(190.0) as u8);
         let panel_line2 = alpha_color(accent2, (35.0 + self.theme.glow as f32 * 1.1).min(150.0) as u8);
 
+        // Phones/tablets are narrow in points: the desktop top bar (fixed
+        // 320 px search + text buttons) does not fit, so switch to a compact
+        // variant with icon buttons and a fluid search field.
+        let compact = ctx.screen_rect().width() < 720.0;
+
         // ---------------- top bar ----------------
         let top_resp = egui::TopBottomPanel::top("topbar")
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .fill(top_fill)
-                    .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+                    .inner_margin(egui::Margin::symmetric(
+                        if compact { 8.0 } else { 14.0 },
+                        8.0,
+                    )),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -3003,11 +3098,23 @@ impl eframe::App for ScwollApp {
                             .rounding(egui::Rounding::same(7.0)),
                     )
                     .on_hover_text("Scwoll");
-                    ui.add_space(10.0);
+                    ui.add_space(if compact { 6.0 } else { 10.0 });
+                    // Leave room for the clear button and the two action
+                    // buttons, and let the search field fill the rest.
+                    let reserved = if compact { 116.0 } else { 190.0 };
+                    let search_w = if compact {
+                        (ui.available_width() - reserved).max(70.0)
+                    } else {
+                        320.0
+                    };
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Search videos, categories, urls…")
-                            .desired_width(320.0),
+                            .hint_text(if compact {
+                                "Search…"
+                            } else {
+                                "Search videos, categories, urls…"
+                            })
+                            .desired_width(search_w),
                     );
                     let _ = resp;
                     if ui
@@ -3019,13 +3126,13 @@ impl eframe::App for ScwollApp {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let settings = ui
-                            .anim_button("⚙ Settings")
+                            .anim_button(if compact { "⚙" } else { "⚙ Settings" })
                             .on_hover_text("Appearance, font, glass and colour options");
                         if settings.clicked() {
                             toggle_dropdown(ui, settings_popup_id());
                         }
                         let import = ui
-                            .anim_button("📥 Import")
+                            .anim_button(if compact { "📥" } else { "📥 Import" })
                             .on_hover_text("Add videos from a URL, list or folder");
                         if import.clicked() {
                             toggle_dropdown(ui, import_popup_id());
@@ -3038,6 +3145,8 @@ impl eframe::App for ScwollApp {
                         };
                         let settings_anchor = anchor_below_top_bar(&settings, panel_bottom);
                         let import_anchor = anchor_below_top_bar(&import, panel_bottom);
+                        // Never let a dropdown be wider than the screen.
+                        let popup_max = (ctx.screen_rect().width() - 20.0).max(240.0);
 
                         if ui.memory(|m| m.is_popup_open(settings_popup_id())) {
                             ui.scope(|ui| {
@@ -3048,7 +3157,7 @@ impl eframe::App for ScwollApp {
                                     &settings_anchor,
                                     egui::popup::PopupCloseBehavior::CloseOnClickOutside,
                                     |ui| {
-                                        ui.set_width(620.0);
+                                        ui.set_width(620.0_f32.min(popup_max));
                                         self.settings_dropdown_contents(ui, muted);
                                     },
                                 );
@@ -3063,7 +3172,7 @@ impl eframe::App for ScwollApp {
                                     &import_anchor,
                                     egui::popup::PopupCloseBehavior::CloseOnClickOutside,
                                     |ui| {
-                                        ui.set_width(470.0);
+                                        ui.set_width(470.0_f32.min(popup_max));
                                         self.import_dropdown_contents(ui);
                                     },
                                 );
@@ -3077,11 +3186,11 @@ impl eframe::App for ScwollApp {
 
         // ---------------- sidebar ----------------
         let side_resp = egui::SidePanel::left("sidebar")
-            .exact_width(228.0)
+            .exact_width(if compact { 150.0 } else { 228.0 })
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .fill(sidebar_fill)
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+                    .inner_margin(egui::Margin::symmetric(if compact { 8.0 } else { 12.0 }, 8.0)),
             )
             .show(ctx, |ui| {
                 // One scrollbar for the whole sidebar: categories scroll with
@@ -3110,7 +3219,10 @@ impl eframe::App for ScwollApp {
                 ui.horizontal(|ui| {
                     ui.heading("Categories");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.anim_small_button("⚙ Manage").on_hover_text("Rename / move / clear categories").clicked() {
+                        let manage = ui
+                            .anim_small_button(if compact { "⚙" } else { "⚙ Manage" })
+                            .on_hover_text("Rename / move / clear categories");
+                        if manage.clicked() {
                             self.show_cats = true;
                         }
                     });
@@ -3143,7 +3255,11 @@ impl eframe::App for ScwollApp {
                     self.videos.iter().filter(|v| v.kind == VideoKind::Local).count(),
                     self.videos.iter().filter(|v| v.kind == VideoKind::Direct).count(),
                 );
-                ui.small(format!("📼 {} total · ▶ {yt} · 🗂 {lo} · 🔗 {di}", self.videos.len()));
+                if compact {
+                    ui.small(format!("📼 {} · ▶ {yt} · 🗂 {lo} · 🔗 {di}", self.videos.len()));
+                } else {
+                    ui.small(format!("📼 {} total · ▶ {yt} · 🗂 {lo} · 🔗 {di}", self.videos.len()));
+                }
                 ui.small(format!("Player: {}", if self.player.child.is_some() { "busy" } else { "idle" }));
                 });
             });
@@ -3922,7 +4038,7 @@ impl ScwollApp {
                 ui.label(egui::RichText::new(if playing { "▶ NOW PLAYING (mpv window)" } else { "🎬 READY" }).color(egui::Color32::WHITE).heading());
                 ui.label(egui::RichText::new(v.title.clone()).color(egui::Color32::WHITE).strong());
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.anim_button(if playing { "⏸ Stop" } else { "▶ Play in mpv" }).clicked() {
                         if playing {
                             self.player.stop();
@@ -3954,9 +4070,18 @@ impl ScwollApp {
             }).color(muted));
         });
         ui.add(egui::TextEdit::singleline(&mut self.edit_title).hint_text("Title").desired_width(f32::INFINITY));
+        // Narrow screens (phones): the category field takes the remaining
+        // width instead of a fixed 160 pts that pushes the actions off-screen.
         ui.horizontal(|ui| {
             ui.label("Category:");
-            ui.add(egui::TextEdit::singleline(&mut self.edit_cat).hint_text("e.g. Music").desired_width(160.0));
+            let w = (ui.available_width() - 8.0).max(80.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.edit_cat)
+                    .hint_text("e.g. Music")
+                    .desired_width(w),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
             // Quick-pick from existing categories (fills the text field; hit Save).
             let cats: Vec<String> = self.categories().into_iter().map(|(n, _)| n).collect();
             egui::ComboBox::from_id_source(format!("theater-cat-{}", v.id))
@@ -4099,7 +4224,7 @@ impl ScwollApp {
                             ui.label("Category:");
                             ui.add(egui::TextEdit::singleline(&mut self.in_bulk_cat).hint_text("General").desired_width(140.0));
                             if ui.anim_button("📄 Choose .txt…").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().add_filter("text", &["txt", "m3u", "m3u8", "csv"]).pick_file() {
+                                if let Some(path) = pick_text_file() {
                                     if let Ok(content) = std::fs::read_to_string(&path) {
                                         if !self.in_bulk.is_empty() {
                                             self.in_bulk.push('\n');
@@ -4122,7 +4247,7 @@ impl ScwollApp {
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.in_folder).hint_text("/home/you/Videos").desired_width(320.0));
                             if ui.anim_button("📁 Browse…").clicked() {
-                                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                if let Some(dir) = pick_folder() {
                                     self.in_folder = dir.to_string_lossy().to_string();
                                 }
                             }
@@ -4414,10 +4539,7 @@ impl ScwollApp {
                                     ui.label(file_label)
                                         .on_hover_text(&self.theme.background_image);
                                     if ui.anim_button("📁 Choose…").clicked() {
-                                        if let Some(file) = rfd::FileDialog::new()
-                                            .add_filter("images", &["png", "jpg", "jpeg"])
-                                            .pick_file()
-                                        {
+                                        if let Some(file) = pick_image_file() {
                                             let path = file.to_string_lossy().to_string();
                                             self.theme.background_image = path.clone();
                                             bg_job = Some(Some(path));
@@ -4629,7 +4751,9 @@ impl ScwollApp {
                         }
             });
         ui.separator();
-                ui.horizontal(|ui| {
+                // Wraps on narrow (phone) layouts instead of pushing the path
+                // label on top of the buttons.
+                ui.horizontal_wrapped(|ui| {
                     if ui.anim_button("Reset defaults").clicked() {
                         self.theme = Theme::default();
                         font_job = Some(None);
@@ -4652,10 +4776,15 @@ impl ScwollApp {
                             self.toast(format!("Could not open data folder: {e}"));
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(format!("data: {}", data_dir().display())).color(muted).small());
-                    });
                 });
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("data: {}", data_dir().display()))
+                            .color(muted)
+                            .small(),
+                    )
+                    .wrap(),
+                );
         if let Some(job) = font_job {
             match apply_ui_font(&ctx, job.as_ref()) {
                 Ok(()) => {
@@ -4748,21 +4877,120 @@ impl ScwollApp {
     }
 }
 
+// ------------------------------------------------------- platform pickers --
+/// Pick a text import file. Android has no `rfd` backend, so this is a no-op
+/// there (users type/paste URLs into the bulk box instead).
+#[cfg(not(target_os = "android"))]
+fn pick_text_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("text", &["txt", "m3u", "m3u8", "csv"])
+        .pick_file()
+}
+#[cfg(target_os = "android")]
+fn pick_text_file() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_os = "android"))]
+fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+#[cfg(target_os = "android")]
+fn pick_folder() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_os = "android"))]
+fn pick_image_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("images", &["png", "jpg", "jpeg"])
+        .pick_file()
+}
+#[cfg(target_os = "android")]
+fn pick_image_file() -> Option<PathBuf> {
+    None
+}
+
 // ------------------------------------------------------------------ main --
+fn native_options() -> eframe::NativeOptions {
+    // Transparent window surfaces are not supported on Android's native
+    // activity path (and are ignored/unsupported by winit there).
+    #[cfg(not(target_os = "android"))]
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_transparent(true)
+        .with_icon(logo_icon_data());
+
+    #[cfg(target_os = "android")]
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_icon(logo_icon_data());
+
+    eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    }
+}
+
+fn app_creator() -> eframe::AppCreator {
+    Box::new(|cc| Ok(Box::new(ScwollApp::new(cc).finish_startup(&cc.egui_ctx))))
+}
+
+#[cfg(not(target_os = "android"))]
 fn main() -> eframe::Result<()> {
     migrate_legacy_data();
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_transparent(true)
-            .with_icon(logo_icon_data()),
-        ..Default::default()
-    };
     eframe::run_native(
         "Scwoll — media player",
-        opts,
-        Box::new(|cc| Ok(Box::new(ScwollApp::new(cc).finish_startup(&cc.egui_ctx)))),
+        native_options(),
+        app_creator(),
     )
+}
+
+/// Builds a `NativeOptions` hooked up to the Android `AndroidApp` handle, so
+/// the winit event loop is created correctly for a `NativeActivity`.
+#[cfg(target_os = "android")]
+fn android_options(app: winit::platform::android::activity::AndroidApp) -> eframe::NativeOptions {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let mut options = native_options();
+    options.event_loop_builder = Some(Box::new(move |builder| {
+        builder.with_android_app(app);
+    }));
+    options
+}
+
+/// Runs the app on Android. Called from `android_main` in `src/lib.rs` (the
+/// `cdylib` that the APK actually loads).
+#[cfg(target_os = "android")]
+pub fn run_android(app: winit::platform::android::activity::AndroidApp) {
+    std::env::set_var("RUST_BACKTRACE", "full");
+    eprintln!("[scwoll] android_main entered");
+
+    // Persist library.json / theme.json / thumbnails inside the app's
+    // private data directory instead of a relative `./data` path.
+    if let Some(dir) = app.internal_data_path() {
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        eprintln!("[scwoll] data dir: {}", dir.display());
+    } else {
+        eprintln!("[scwoll] no internal data dir from AndroidApp");
+    }
+    migrate_legacy_data();
+
+    eprintln!("[scwoll] building eframe window + EGL context");
+    let result = eframe::run_native(
+        "Scwoll — media player",
+        android_options(app),
+        app_creator(),
+    );
+    eprintln!("[scwoll] eframe::run_native returned: {result:?}");
+}
+
+/// `cargo apk` compiles every target of the package for the Android triple,
+/// including this binary, but the APK only ships the `cdylib` (whose
+/// `android_main` is the real entry point). This stub keeps the bin linkable.
+#[cfg(target_os = "android")]
+fn main() {
+    eprintln!("scwoll: the desktop binary is not used on Android — launch the Scwoll app instead.");
 }
 
 #[cfg(test)]

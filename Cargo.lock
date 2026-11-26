@@ -3000,6 +3000,8 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "jni 0.21.1",
+ "ndk-context",
  "open",
  "raw-window-handle 0.6.2",
  "rfd",
@@ -3013,6 +3015,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols 0.32.13",
  "wayland-protocols-plasma",
+ "winit",
  "x11rb",
 ]
 

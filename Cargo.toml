@@ -8,15 +8,22 @@ description = "Scwoll — YouTube-style native media player in Rust (egui + mpv)
 name = "scwoll"
 path = "src/main.rs"
 
+# Android builds compile the same app as a `cdylib` (native activity).
+# `src/lib.rs` simply re-exports `src/main.rs` as a module so the Android
+# entry point (`android_main`) is linked into the shared library.
+[lib]
+name = "scwoll"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "accesskit", "wayland", "x11"] }
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "accesskit", "wayland", "x11", "android-native-activity"] }
 egui = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 chrono = { version = "0.4", features = ["serde"] }
-rfd = "0.15"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5"
@@ -29,3 +36,64 @@ wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-plasma = { version = "0.2", features = ["client"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 x11rb = "0.13"
+
+# rfd has no Android backend, so file dialogs are desktop-only.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15"
+
+# winit is needed directly on Android to attach the native `AndroidApp`
+# to eframe's event loop builder and re-export the `AndroidApp` type.
+# `jni` + `ndk-context` drive the system video player (ACTION_VIEW intents)
+# and MediaMetadataRetriever thumbnails.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.29", default-features = false, features = ["android-native-activity"] }
+# Keep these on the same versions winit/android-activity already link, so there
+# is exactly one `android-activity`/`ndk-context` in the graph.
+jni = "0.21"
+ndk-context = "0.1"
+
+# cargo-apk / xbuild configuration.
+[package.metadata.android]
+package = "dev.scwoll.app"
+build_targets = ["aarch64-linux-android"]
+resources = "android/res"
+apk_name = "scwoll"
+
+[package.metadata.android.sdk]
+min_sdk_version = 23
+# Must match an installed `platforms/android-XX` in the Android SDK (see
+# shell-android.nix, which installs android-34).
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Scwoll"
+icon = "@mipmap/ic_launcher"
+uses_cleartext_traffic = true
+
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|screenSize"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+# ----------------------------------------------------------------- profiles --
+# Keep the release .so small (cargo strips it during the build, so no
+# cargo-apk `strip` setting is needed and debug builds keep their symbols).
+[profile.release]
+strip = "symbols"
+
+# Android debug builds only.
+#
+# `android-activity` 0.5.2 (pinned by winit 0.29) does
+#     slice::from_raw_parts(saved_state_ptr, 0)
+# with a NULL pointer when the activity has no saved instance state. That is
+# technically UB, and rustc's *debug-only* UB precondition checks panic on it
+# (`unsafe precondition(s) violated: slice::from_raw_parts requires the pointer
+# to be aligned and non-null`) inside `ANativeActivity_onCreate`, i.e. the app
+# aborts before `android_main` ever runs. Release builds compile those checks
+# out. Keep the checks off here too, while keeping overflow checks and debug
+# info so `adb logcat` backtraces stay useful.
+[profile.android-dev]
+inherits = "dev"
+debug-assertions = false
+overflow-checks = true

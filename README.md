@@ -73,6 +73,96 @@ inside `nix-shell` via `shell.nix`):
 which mpv   # /etc/profiles/per-user/atlas/bin/mpv ✓
 ```
 
+## Android (arm64 APK)
+
+Scwoll can be compiled as a standalone Android APK for `aarch64-linux-android`
+(arm64) and run on Android phones/tablets. It runs as a `NativeActivity` and
+switches to a **Material You (Material 3) phone UI**: top app bar, horizontally
+scrollable category chips, a vertical feed of media cards, a bottom navigation
+bar (Home / YouTube / Local / Sources) and full-screen Settings / Import pages.
+The colours are derived from the app theme's accent, so the existing theme
+picker also recolours the phone UI.
+
+Build with `cargo-apk` (configured via `[package.metadata.android]` in
+`Cargo.toml`, launcher icons in `android/res/mipmap-*/ic_launcher.png`).
+The `scwoll` package has both a `[[bin]]` (desktop) and a `cdylib` `[lib]`
+(Android), so the build must pass `--lib` — `./build-apk.sh` does that for you.
+
+```bash
+# 1. Nix-provided Android SDK + NDK + rustup + adb + JDK + host `cc`
+#    (one-time; accepts the unfree Android SDK license, downloads several GB):
+export NIXPKGS_ALLOW_UNFREE=1
+export NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1
+nix-shell shell-android.nix
+
+# 2. Inside the shell (one-time): install the Rust toolchain + arm64 target,
+#    then build (installs cargo-apk automatically if needed):
+rustup default stable
+./build-apk.sh
+
+# 3. Install & launch on a connected device:
+adb install -r target/release/apk/scwoll.apk
+adb shell am start -n dev.scwoll.app/android.app.NativeActivity
+
+# 4. Logs (stdout/stderr are forwarded to logcat):
+adb logcat -d -s RustStdoutStderr:V AndroidRuntime:E DEBUG:E libc:F
+```
+
+If you prefer Android Studio's SDK/NDK instead of the Nix ones, skip
+`shell-android.nix` and export the usual paths before running `./build-apk.sh`:
+
+```bash
+export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/<version>
+export ANDROID_HOME=$HOME/Android/Sdk
+nix-shell -p rustup --run 'rustup default stable'
+./build-apk.sh
+```
+
+Notes for Android:
+
+- `./build-apk.sh` checks the prerequisites, installs `cargo-apk` if needed,
+  and runs `cargo apk build --profile release --lib` for
+  `aarch64-linux-android` only (`--lib` avoids a `Bin is not compatible with
+  Cdylib` panic from cargo-apk).
+- It builds a **release** APK (~4 MB) signed with a locally generated key at
+  `~/.android/scwoll-release.keystore` (password `android`; override with
+  `CARGO_APK_RELEASE_KEYSTORE` / `CARGO_APK_RELEASE_KEYSTORE_PASSWORD`).
+- **Why release by default:** `android-activity` 0.5.2 (pinned by winit 0.29)
+  calls `slice::from_raw_parts(null, 0)` for the absent saved instance state.
+  rustc's debug-only UB precondition checks panic on that inside
+  `ANativeActivity_onCreate`, so a `--profile dev` build aborts at startup
+  before `android_main` runs. Release builds compile those checks out; the
+  `[profile.android-dev]` entry in `Cargo.toml` keeps the same guarantee for
+  debug builds (`PROFILE=dev ./build-apk.sh`, output in
+  `target/android-dev/apk/`).
+- The system status and navigation bars stay visible; the phone UI reads
+  their insets (`WindowInsets` via JNI, re-checked about once a second) and
+  pads the top app bar and bottom navigation so nothing sits underneath them.
+- The desktop (glass, multi-pane) UI is still there: the Material 3 layout is
+  only used on Android. On desktop nothing changes, and the same code paths are
+  compiled with `#[cfg(target_os = "android")]`.
+- Persistence (`library.json`, `theme.json`, thumbnails) lives in the app's
+  private data directory (`XDG_CONFIG_HOME` is pointed at the Android internal
+  data dir on startup).
+- File dialogs (`.txt` import, folder scan, background image) have no Android
+  backend, so those picker buttons are no-ops on Android; URLs and paths can
+  still be pasted/typed directly.
+- External `mpv`/`ffmpeg` are not present on Android, so the desktop playback
+  and thumbnail-mosaic code is bypassed:
+  - **Playback** fires an `android.intent.action.VIEW` intent, so videos open in
+    the **system video player** (VLC, MX Player, …) and YouTube links open in
+    the YouTube app / browser. Because a gallery app with no
+    `android.permission.INTERNET` cannot stream a remote URL, Scwoll checks the
+    installed `video/*` handlers: if the default one cannot reach the network it
+    shows a chooser (when another player can) or hands the URL to the browser,
+    which plays it inline.
+  - **Thumbnails** for direct links come from `MediaMetadataRetriever`
+    (embedded artwork, else a frame ~10% in), so the media cards still get a
+    real preview. YouTube artwork keeps using the online thumbnail.
+- Navigation is in-app: tap a card for its detail page (`← Back` returns to the
+  feed), the bottom bar switches destination. The Android hardware back key is
+  not intercepted (it is swallowed by the native-activity glue).
+
 ## Nix flake
 
 This repository is a flake, so it can be used directly or imported into a
@@ -155,11 +245,17 @@ module also adds Scwoll to your application launcher.
 ## Layout
 
 ```
-Cargo.toml        # eframe/egui + rfd dialogs + ureq/image thumbs
+Cargo.toml        # eframe/egui + rfd dialogs + ureq/image thumbs + Android metadata
 src/
   main.rs         # egui app: library, theater, imports, themes, mpv player
+  lib.rs          # Android cdylib entry (includes main.rs as a module)
+  android.rs      # Android JNI: ACTION_VIEW playback + MediaMetadataRetriever thumbs
+  mobile.rs       # Material You phone UI (Android): app bar, chips, cards, bottom nav, sheets
   model.rs        # Video/Theme types, YouTube-id parsing, title guessing (+ unit tests)
   system_blur.rs  # compositor blur request (Wayland ext-background-effect / X11)
+android/res/      # Android launcher icons (mipmap-*)
+build-apk.sh      # cargo-apk arm64 APK build helper
+shell-android.nix # Android SDK + NDK + rustup + adb dev shell
 sample_urls.txt   # sample bulk-import list
 shell.nix         # cargo + eframe system libs (GL/wayland/xkb/gtk)
 flake.nix         # flake outputs: packages / apps / devShells / overlay / HM module

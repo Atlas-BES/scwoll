@@ -1,0 +1,16 @@
+cd ~/Projects/Scwoll
+
+   # 1. Enter the Android shell (one-time; downloads SDK + NDK, several GB)
+   export NIXPKGS_ALLOW_UNFREE=1
+   export NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1
+   nix-shell shell-android.nix
+
+   # 2. Inside the shell, first time only: install the Rust toolchain
+   rustup default stable
+
+   # 3. Build the APK (auto-installs cargo-apk + the arm64 Rust std target)
+   ./build-apk.sh
+
+   # 4. Install & launch on a connected device
+   adb install -r target/debug/apk/scwoll.apk
+   adb shell am start -n dev.scwoll.app/android.app.NativeActivity
